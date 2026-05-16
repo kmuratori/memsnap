@@ -32,8 +32,8 @@ unsigned char shell_bind[] = {
 int shell_bind_len = 81;
 
 /* Infinite pause loop (jmp $) */
-unsigned char pause_loop[] = { 0xeb, 0xfe };
-int pause_loop_len = 2;
+unsigned char shell_pause[] = { 0xeb, 0xfe };
+int shell_pause_len = 2;
 
 void set_flag(const char *path) {
     FILE *f = fopen(path, "w");

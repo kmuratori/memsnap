@@ -12,9 +12,6 @@ extern int shell_binsh_len;
 extern unsigned char shell_bind[];
 extern int shell_bind_len;
 
-extern unsigned char pause_loop[];
-extern int pause_loop_len;
-
 void set_flag(const char *path);
 void clear_flag(const char *path);
 

