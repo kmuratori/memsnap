@@ -1,17 +1,17 @@
 # Credential scraping simulation
-install_cred_scrape() {
+install_credscrape() {
     echo "[*] Starting credential scraping..."
     nohup "$ASSETS_DIR/build/cred_scrape_v2" >/dev/null 2>&1 &
     echo $! > /tmp/cred_scrape.pid
-    set_flag "cred_scrape"
+    set_flag "credscrape"
 }
 
-clean_cred_scrape() {
+clean_credscrape() {
     echo "[*] Cleaning credential scrape..."
     if [ -f /tmp/cred_scrape.pid ]; then
         kill $(cat /tmp/cred_scrape.pid) 2>/dev/null || true
         rm -f /tmp/cred_scrape.pid
     fi
     pkill -f "cred_scrape" 2>/dev/null || true
-    clear_flag "cred_scrape"
+    clear_flag "credscrape"
 }

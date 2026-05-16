@@ -1,13 +1,13 @@
-install_multi_stage() {
+install_multistage() {
     echo "[*] Starting multi-stage loader..."
-    "$ASSETS_DIR/build/multi_stage_loader" "$ASSETS_DIR/build/pause_binary" && set_flag "multi_stage"
+    "$ASSETS_DIR/build/multi_stage_loader" "$ASSETS_DIR/build/pause_binary" && set_flag "multistage"
 }
 
-clean_multi_stage() {
+clean_multistage() {
     echo "[*] Cleaning multi-stage loader..."
     for pidfile in /tmp/stage3.pid /tmp/.stage*; do
         [ -f "$pidfile" ] && kill $(cat "$pidfile") 2>/dev/null || true
     done
     pkill -f "multi_stage_loader" 2>/dev/null || true
-    clear_flag "multi_stage"
+    clear_flag "multistage"
 }

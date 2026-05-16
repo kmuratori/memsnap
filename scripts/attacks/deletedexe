@@ -1,12 +1,12 @@
 YELLOW='\033[0;33m'
 RESET='\033[0m'
 
-install_deleted_exe() {
+install_deletedexe() {
     echo -e "${YELLOW}WARNING: deleted_exe is currently broken (hangs the installer) and will be removed in a future release. Skipping.${RESET}" >&2
     return 0
 }
 
-clean_deleted_exe() {
+clean_deletedexe() {
     echo -e "${YELLOW}WARNING: deleted_exe cleanup may not be fully effective.${RESET}" >&2
     rm -f /tmp/.deleted_exe_active /tmp/to_delete
     return 0

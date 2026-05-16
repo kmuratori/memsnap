@@ -1,11 +1,11 @@
-install_fileless_shm() {
+install_filelessshm() {
     echo "[*] Starting fileless shared memory execution..."
-    "$ASSETS_DIR/build/fileless_shm" "$ASSETS_DIR/build/pause_binary" && set_flag "fileless_shm"
+    "$ASSETS_DIR/build/fileless_shm" "$ASSETS_DIR/build/pause_binary" && set_flag "filelessshm"
 }
 
-clean_fileless_shm() {
+clean_filelessshm() {
     echo "[*] Cleaning fileless shared memory..."
     pkill -f "/dev/shm/xSHM_PAYLOAD" 2>/dev/null || true
     rm -f /dev/shm/xSHM_PAYLOAD
-    clear_flag "fileless_shm"
+    clear_flag "filelessshm"
 }

@@ -1,5 +1,5 @@
 # Ptrace-based injection into a sleep process
-install_ptrace_injection() {
+install_ptraceinjection() {
     echo "[*] Starting ptrace injection..."
     # Start target process
     sleep 9999 &
@@ -9,15 +9,15 @@ install_ptrace_injection() {
     
     # Wait a moment then inject
     sleep 0.5
-    "$ASSETS_DIR/build/ptrace_inject" $SLEEP_PID && set_flag "ptrace_injection"
+    "$ASSETS_DIR/build/ptrace_inject" $SLEEP_PID && set_flag "ptraceinjection"
 }
 
-clean_ptrace_injection() {
+clean_ptraceinjection() {
     echo "[*] Cleaning ptrace injection..."
     if [ -f /tmp/ptrace_target.pid ]; then
         kill $(cat /tmp/ptrace_target.pid) 2>/dev/null || true
         rm -f /tmp/ptrace_target.pid
     fi
     pkill -f "sleep 9999" 2>/dev/null || true
-    clear_flag "ptrace_injection"
+    clear_flag "ptraceinjection"
 }

@@ -1,13 +1,12 @@
 # BPFDoor simulation — passive BPF socket backdoor
-install_bpf_backdoor() {
+install_bpfbackdoor() {
     echo "[*] Installing BPFDoor simulation..."
-    "$ASSETS_DIR/build/bpf_backdoor" && set_flag "bpf_backdoor"
+    "$ASSETS_DIR/build/bpf_backdoor" && set_flag "bpfbackdoor"
 }
 
-clean_bpf_backdoor() {
+clean_bpfbackdoor() {
     echo "[*] Cleaning BPFDoor..."
     pkill -f "bpf_backdoor" 2>/dev/null || true
     pkill -f "\[kbpfd\]" 2>/dev/null || true
-    rm -f /tmp/.bpf_backdoor_active
-    clear_flag "bpf_backdoor"
+    clear_flag "bpfbackdoor"
 }
