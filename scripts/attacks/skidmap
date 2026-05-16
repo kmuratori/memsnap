@@ -1,0 +1,14 @@
+# Skidmap cryptominer + fake kmod + PAM backdoor
+install_skidmap() {
+    echo "[*] Installing Skidmap simulation..."
+    "$ASSETS_DIR/build/skidmap_sim" && set_flag "skidmap"
+}
+
+clean_skidmap() {
+    echo "[*] Cleaning Skidmap..."
+    pkill -f "skidmap_sim" 2>/dev/null || true
+    pkill -f "\[skd_crypto\]" 2>/dev/null || true
+    rm -f /tmp/.skidmap_*
+    rm -f /tmp/.pam_skidmap*
+    clear_flag "skidmap"
+}

@@ -1,0 +1,13 @@
+# TeamTNT cloud cryptominer simulation
+install_team_tnt() {
+    echo "[*] Installing TeamTNT cloud cryptominer..."
+    "$ASSETS_DIR/build/team_tnt_sim" && set_flag "team_tnt"
+}
+
+clean_team_tnt() {
+    echo "[*] Cleaning TeamTNT..."
+    pkill -f "team_tnt_sim" 2>/dev/null || true
+    pkill -f "\[docker-cpu\]" 2>/dev/null || true
+    rm -f /tmp/.teamtnt_*
+    clear_flag "team_tnt"
+}

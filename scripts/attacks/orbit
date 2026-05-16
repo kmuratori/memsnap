@@ -1,0 +1,28 @@
+# Orbit advanced LD_PRELOAD implant simulation
+install_orbit() {
+    echo "[*] Installing Orbit implant..."
+    # Install the shared library
+    cp "$ASSETS_DIR/build/orbit_implant.so" /usr/lib/liborbit.so 2>/dev/null || true
+    # Add to ld.so.preload for persistence (like real Orbit)
+    echo "/usr/lib/liborbit.so" >> /etc/ld.so.preload 2>/dev/null || true
+    # Also inject via LD_PRELOAD for immediate effect
+    export LD_PRELOAD="/usr/lib/liborbit.so:$LD_PRELOAD"
+    # Launch SSH-like process to show hooking
+    nohup bash -c "export LD_PRELOAD=/usr/lib/liborbit.so; while true; do sleep 10; done" >/dev/null 2>&1 &
+    echo $! > /tmp/orbit_daemon.pid
+    set_flag "orbit"
+}
+
+clean_orbit() {
+    echo "[*] Cleaning Orbit..."
+    if [ -f /tmp/orbit_daemon.pid ]; then
+        kill $(cat /tmp/orbit_daemon.pid) 2>/dev/null || true
+        rm -f /tmp/orbit_daemon.pid
+    fi
+    pkill -f "orbit_implant" 2>/dev/null || true
+    # Remove from ld.so.preload
+    sed -i '/liborbit/d' /etc/ld.so.preload 2>/dev/null || true
+    rm -f /usr/lib/liborbit.so
+    rm -f /tmp/.orbit_*
+    clear_flag "orbit"
+}

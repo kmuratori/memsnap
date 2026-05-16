@@ -43,3 +43,12 @@ void set_flag(const char *path) {
 void clear_flag(const char *path) {
     unlink(path);
 }
+
+void log_attack(const char *module, const char *msg) {
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm);
+    fprintf(stderr, "[%s] [%s] %s\n", buf, module, msg);
+}
+

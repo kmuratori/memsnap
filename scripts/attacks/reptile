@@ -1,0 +1,13 @@
+# Reptile VFS hook rootkit simulation
+install_reptile() {
+    echo "[*] Installing Reptile VFS hook simulation..."
+    "$ASSETS_DIR/build/reptile_sim" && set_flag "reptile"
+}
+
+clean_reptile() {
+    echo "[*] Cleaning Reptile..."
+    pkill -f "reptile_sim" 2>/dev/null || true
+    pkill -f "\[reptiled\]" 2>/dev/null || true
+    rm -f /tmp/.reptile_kmod
+    clear_flag "reptile"
+}

@@ -1,0 +1,17 @@
+# Syslogk netfilter hook rootkit simulation
+install_syslogk() {
+    echo "[*] Installing Syslogk netfilter hook simulation..."
+    "$ASSETS_DIR/build/syslogk_sim" && set_flag "syslogk"
+}
+
+clean_syslogk() {
+    echo "[*] Cleaning Syslogk..."
+    pkill -f "syslogk_sim" 2>/dev/null || true
+    pkill -f "\[syslogkd\]" 2>/dev/null || true
+    if [ -f /tmp/syslogk_child.pid ]; then
+        kill $(cat /tmp/syslogk_child.pid) 2>/dev/null || true
+        rm -f /tmp/syslogk_child.pid
+    fi
+    rm -f /tmp/.syslogk_*
+    clear_flag "syslogk"
+}

@@ -1,0 +1,13 @@
+# Mirai self-deleting DDoS bot simulation
+install_mirai() {
+    echo "[*] Installing Mirai bot simulation..."
+    "$ASSETS_DIR/build/mirai_sim" && set_flag "mirai"
+}
+
+clean_mirai() {
+    echo "[*] Cleaning Mirai..."
+    pkill -f "mirai_sim" 2>/dev/null || true
+    pkill -f "\[kworker/u4" 2>/dev/null || true
+    rm -f /tmp/.mirai_*
+    clear_flag "mirai"
+}
