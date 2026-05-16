@@ -52,11 +52,22 @@ _clear_queue() {
     rm -f "$QUEUE_FILE"
 }
 
+is_valid_attack() {
+    local name="$1"
+    [ -x "$ATTACKS_DIR/$name" ]
+}
+
 while getopts "IA:D:ClrRa:s" opt; do
     case $opt in
         I) INSTALL_COMPLETION=true ;;
 
         A)
+            if ! is_valid_attack "$OPTARG"; then
+                echo "[!] Invalid attack: $OPTARG – skipping." >&2
+                QUEUE_OP=true
+                continue
+            fi
+
             already=false
             for a in "${SELECTED[@]}"; do
                 [ "$a" = "$OPTARG" ] && already=true && break
@@ -102,42 +113,44 @@ shift $((OPTIND-1))
 
 if $INSTALL_COMPLETION; then
     COMPLETION_FILE="/tmp/memsnap-completion.bash"
-    cat > "$COMPLETION_FILE" << 'EOF'
+    _attack_list=""
+    for f in "$ATTACKS_DIR"/*; do
+        [ -x "$f" ] && _attack_list+="$(basename "$f") "
+    done
+    _attack_list="${_attack_list% }"
+
+    cat > "$COMPLETION_FILE" << EOF
 #!/usr/bin/env bash
-_attack_list="rootkit injection backdoor reverse_shell ptrace_injection hollowing deleted_exe persistence cred_scrape cryptominer"
+_attack_list="$_attack_list"
 
 _memsnap_infect_completion() {
     local cur prev words cword
-    # Use _init_completion if available (bash-completion ≥2), else fall back
     if declare -f _init_completion &>/dev/null; then
         _init_completion || return
     else
-        cur="${COMP_WORDS[COMP_CWORD]}"
-        prev="${COMP_WORDS[COMP_CWORD-1]}"
-        words=("${COMP_WORDS[@]}")
-        cword=$COMP_CWORD
+        cur="\${COMP_WORDS[COMP_CWORD]}"
+        prev="\${COMP_WORDS[COMP_CWORD-1]}"
+        words=(\${COMP_WORDS[@]})
+        cword=\$COMP_CWORD
     fi
 
-    # Word 1 = subcommand slot  →  offer "infect" (and any other scripts you add later)
-    if [ "$cword" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "infect" -- "$cur") )
+    if [ "\$cword" -eq 1 ]; then
+        COMPREPLY=( \$(compgen -W "infect" -- "\$cur") )
         return
     fi
 
-    # Word 1 must be "infect" for everything below
-    [ "${words[1]}" = "infect" ] || return
+    [ "\${words[1]}" = "infect" ] || return
 
-    case "$prev" in
+    case "\$prev" in
         -A|-D)
-            COMPREPLY=( $(compgen -W "$_attack_list" -- "$cur") )
+            COMPREPLY=( \$(compgen -W "\$_attack_list" -- "\$cur") )
             ;;
         *)
-            COMPREPLY=( $(compgen -W "-l -r -R -A -D -C -a -s -I" -- "$cur") )
+            COMPREPLY=( \$(compgen -W "-l -r -R -A -D -C -a -s -I" -- "\$cur") )
             ;;
     esac
 }
 
-# Register for every name the entrypoint might be invoked as
 complete -F _memsnap_infect_completion memsnap ./memsnap
 EOF
     echo "[+] Completion script written to $COMPLETION_FILE"
