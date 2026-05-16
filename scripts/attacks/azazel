@@ -1,15 +1,18 @@
-# Azazel LD_PRELOAD implant simulation
 install_azazel() {
     echo "[*] Installing Azazel LD_PRELOAD implant..."
-    # Preload the implant into the current shell session
-    export LD_PRELOAD="$ASSETS_DIR/build/azazel_implant.so"
-    # Also inject into a long-running process for visibility
+    # Ensure the .so is built
+    if [ ! -f "$ASSETS_DIR/build/azazel_implant.so" ]; then
+        echo "[!] azazel_implant.so not found – run 'make -C assets' first"
+        return 1
+    fi
+    # Start a long-running process with the preload library
     nohup bash -c "export LD_PRELOAD=$ASSETS_DIR/build/azazel_implant.so; sleep 3600" >/dev/null 2>&1 &
-    echo $! > /tmp/azazel_sleep.pid
-    # Create hidden files that the rootkit hides
-    touch /tmp/.azazel_hidden_config
-    touch /tmp/.azazel_hidden_keylog
+    ec
+    # Create files that the rootkit hides (no stray characters)
+    > /tmp/.azazel_hidden_config
+    > /tmp/.azazel_hidden_keylog
     set_flag "azazel"
+    echo "[+] Azazel implant injected (PID $(cat /tmp/azazel_sleep.pid))"
 }
 
 clean_azazel() {
@@ -21,4 +24,5 @@ clean_azazel() {
     pkill -f "azazel_implant" 2>/dev/null || true
     rm -f /tmp/.azazel_*
     clear_flag "azazel"
+    echo "[+] Azazel cleaned"
 }
