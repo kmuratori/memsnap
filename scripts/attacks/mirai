@@ -2,7 +2,9 @@
 install_mirai() {
     echo "[*] Installing Mirai bot simulation..."
     cp "$ASSETS_DIR/build/mirai_sim" /tmp/.mirai_bin
-    /tmp/.mirai_bin && set_flag "mirai"
+    chmod +x /tmp/.mirai_bin
+    /tmp/.mirai_bin
+    set_flag "mirai"
 }
 
 clean_mirai() {
