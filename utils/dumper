@@ -139,9 +139,7 @@ _manifest_entry() {
     local ts
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     printf '{"timestamp":"%s","label":"%s","path":"%s","attacks":[%s],"status":"%s"}\n' \
-        "$ts" "$label" "$path" \
-        "$(echo "$attacks" | sed 's/ /","/g; s/^/"/; s/$/"/' | sed 's/^""$//')" \
-        "$status" \
+        "$ts" "$label" "$path" "$attacks_str" "$status" \
         >> "$MANIFEST"
 }
 
@@ -200,7 +198,7 @@ fi
 # ── baseline ──────────────────────────────────────────────────────────────────
 section "Baseline (clean)"
 _ensure_clean
-_capture "clean" "$OUTPUT_DIR/clean" "clean"
+_capture "clean" "$OUTPUT_DIR/clean" "\"clean\""
 
 # ── single-attack captures ────────────────────────────────────────────────────
 section "Single-attack captures"
@@ -208,7 +206,7 @@ for attack in "${SELECTED_ATTACKS[@]}"; do
     info "Attack: $attack"
     _ensure_clean
     _install_attacks "$attack"
-    _capture "$attack" "$OUTPUT_DIR/single/$attack" "$attack"
+    _capture "$attack" "$OUTPUT_DIR/single/$attack" "\"$attack\""
     _clean_attacks
     ok "Done: $attack"
 done
@@ -225,7 +223,7 @@ if $DO_PAIRS; then
             info "Pair: $a + $b"
             _ensure_clean
             _install_attacks "$a" "$b"
-            _capture "$label" "$OUTPUT_DIR/pairs/$label" "$a $b"
+            _capture "$label" "$OUTPUT_DIR/pairs/$label" "\"$a\",\"$b\""
             _clean_attacks
             ok "Done: $label"
         done
