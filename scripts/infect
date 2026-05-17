@@ -178,7 +178,7 @@ if [ -n "$ACTION" ]; then
     if [ "$ACTION" = "clean" ] && [ ${#SELECTED[@]} -eq 0 ]; then
         echo "[*] Queue empty – loading all known attacks for cleanup."
         for script in "$ATTACKS_DIR"/*; do
-            [ -x "$script" ] && SELECTED+=("$(basename "$script")")
+            [ -f "$script" ] && [ -x "$script" ] && SELECTED+=("$(basename "$script")")
         done
     fi
 
