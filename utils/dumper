@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# utils/dumper — automated dataset generator for MemSnap
+#
+# Drives the infect pipeline to capture a labeled memory dump for:
+#   - a clean baseline
+#   - every single attack in isolation
+#   - every pair of attacks (optional, --pairs flag)
+#
+# Usage:
+#   ./utils/dumper -o <output_dir> [--pairs] [--attacks a,b,c] [--dry-run]
+#
+# Output structure:
+#   <output_dir>/
+#     clean/
+#       memdump_<ts>_clean.raw
+#     single/<attack>/
+#       memdump_<ts>_<attack>.raw
+#     pairs/<a>_<b>/          (only with --pairs)
+#       memdump_<ts>_<a>_<b>.raw
+#     manifest.jsonl           (one JSON record per capture)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+INFECT="$PROJECT_ROOT/scripts/infect"
+ATTACKS_DIR="$PROJECT_ROOT/scripts/attacks"
+
+# ── defaults ──────────────────────────────────────────────────────────────────
+OUTPUT_DIR="./dataset"
+DO_PAIRS=false
+DRY_RUN=false
+SETTLE_SECS=3          # seconds to wait after install before capture
+SELECTED_ATTACKS=()    # empty = auto-discover from attacks dir
+
+# ── colour helpers ────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; RESET='\033[0m'; BOLD='\033[1m'
+
+info()    { echo -e "${CYAN}[*]${RESET} $*"; }
+ok()      { echo -e "${GREEN}[+]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
+err()     { echo -e "${RED}[-]${RESET} $*" >&2; }
+section() { echo -e "\n${BOLD}${CYAN}══ $* ══${RESET}"; }
+
+usage() {
+    cat <<EOF
+Usage: $0 [options]
+
+  -o <dir>         Output directory (default: ./dataset)
+  -A <a,b,c>       Comma-separated list of attacks to use
+                   (default: auto-discover from scripts/attacks/)
+  -s <secs>        Settle time after install before capture (default: 3)
+  --pairs          Also capture all pairwise attack combinations
+  --dry-run        Print plan without executing anything
+
+  -h               Show this help
+EOF
+    exit 0
+}
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)         OUTPUT_DIR="$2"; shift 2 ;;
+        -A)         IFS=',' read -ra SELECTED_ATTACKS <<< "$2"; shift 2 ;;
+        -s)         SETTLE_SECS="$2"; shift 2 ;;
+        --pairs)    DO_PAIRS=true; shift ;;
+        --dry-run)  DRY_RUN=true; shift ;;
+        -h|--help)  usage ;;
+        *)          err "Unknown option: $1"; usage ;;
+    esac
+done
+
+# ── resolve attack list ───────────────────────────────────────────────────────
+if [ ${#SELECTED_ATTACKS[@]} -eq 0 ]; then
+    while IFS= read -r -d '' f; do
+        [[ -x "$f" ]] && SELECTED_ATTACKS+=("$(basename "$f")")
+    done < <(find "$ATTACKS_DIR" -maxdepth 1 -type f -print0 | sort -z)
+fi
+
+if [ ${#SELECTED_ATTACKS[@]} -eq 0 ]; then
+    err "No attacks found in $ATTACKS_DIR"
+    exit 1
+fi
+
+MANIFEST="$OUTPUT_DIR/manifest.jsonl"
+AVML_BIN="${HOME}/.local/bin/avml"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+_ensure_clean() {
+    # Force a full cleanup regardless of queue state
+    info "Ensuring clean state before capture..."
+    "$INFECT" -R || true
+    sleep 1
+    # Verify via status
+    local active
+    active=$("$INFECT" -s 2>/dev/null || true)
+    if echo "$active" | grep -q "Active:"; then
+        warn "Some attacks still active after cleanup: $active"
+    fi
+}
+
+_ensure_avml() {
+    if [ -x "$AVML_BIN" ]; then return; fi
+    info "Downloading avml..."
+    mkdir -p "$(dirname "$AVML_BIN")"
+    wget -q "https://github.com/microsoft/avml/releases/download/v0.14.0/avml" \
+         -O "$AVML_BIN"
+    chmod +x "$AVML_BIN"
+    ok "avml ready"
+}
+
+_capture() {
+    local label="$1"      # human-readable label for the dump
+    local dest_dir="$2"   # directory to place the dump in
+    local attacks_str="$3" # space-separated list of active attacks (or 'clean')
+
+    mkdir -p "$dest_dir"
+    local ts filename
+    ts=$(date +%Y%m%d_%H%M%S)
+    filename="memdump_${ts}_${label}.raw"
+
+    if $DRY_RUN; then
+        info "[dry-run] Would capture → $dest_dir/$filename"
+        _manifest_entry "$label" "$dest_dir/$filename" "$attacks_str" "dry-run"
+        return
+    fi
+
+    info "Capturing → $dest_dir/$filename"
+    sudo "$AVML_BIN" --compress "$dest_dir/$filename"
+    ok "Saved: $dest_dir/$filename"
+    _manifest_entry "$label" "$dest_dir/$filename" "$attacks_str" "ok"
+}
+
+_manifest_entry() {
+    local label="$1" path="$2" attacks="$3" status="$4"
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    printf '{"timestamp":"%s","label":"%s","path":"%s","attacks":[%s],"status":"%s"}\n' \
+        "$ts" "$label" "$path" \
+        "$(echo "$attacks" | sed 's/ /","/g; s/^/"/; s/$/"/' | sed 's/^""$//')" \
+        "$status" \
+        >> "$MANIFEST"
+}
+
+_install_attacks() {
+    local attacks=("$@")
+    "$INFECT" -C 2>/dev/null || true        # clear queue
+    for a in "${attacks[@]}"; do
+        "$INFECT" -A "$a" 2>/dev/null
+    done
+    if ! $DRY_RUN; then
+        "$INFECT" -r
+        info "Settling for ${SETTLE_SECS}s..."
+        sleep "$SETTLE_SECS"
+    fi
+}
+
+_clean_attacks() {
+    if ! $DRY_RUN; then
+        "$INFECT" -R 2>/dev/null || true
+        sleep 1
+    fi
+}
+
+_join_underscore() {
+    local IFS='_'
+    echo "$*"
+}
+
+# ── pre-flight ────────────────────────────────────────────────────────────────
+section "MemSnap Dumper"
+info "Attacks  : ${SELECTED_ATTACKS[*]}"
+info "Output   : $OUTPUT_DIR"
+info "Pairs    : $DO_PAIRS"
+info "Dry-run  : $DRY_RUN"
+info "Settle   : ${SETTLE_SECS}s"
+
+total_captures=1                                    # baseline
+total_captures=$(( total_captures + ${#SELECTED_ATTACKS[@]} ))  # singles
+if $DO_PAIRS; then
+    n=${#SELECTED_ATTACKS[@]}
+    pairs=$(( n * (n - 1) / 2 ))
+    total_captures=$(( total_captures + pairs ))
+fi
+info "Planned captures: $total_captures"
+
+if ! $DRY_RUN; then
+    _ensure_avml
+    mkdir -p "$OUTPUT_DIR"
+    # Require root for capture (avml needs it)
+    if [[ $EUID -ne 0 ]]; then
+        warn "Not running as root — sudo will be invoked for avml."
+        sudo -v || { err "sudo access required for memory capture"; exit 1; }
+    fi
+fi
+
+# ── baseline ──────────────────────────────────────────────────────────────────
+section "Baseline (clean)"
+_ensure_clean
+_capture "clean" "$OUTPUT_DIR/clean" "clean"
+
+# ── single-attack captures ────────────────────────────────────────────────────
+section "Single-attack captures"
+for attack in "${SELECTED_ATTACKS[@]}"; do
+    info "Attack: $attack"
+    _ensure_clean
+    _install_attacks "$attack"
+    _capture "$attack" "$OUTPUT_DIR/single/$attack" "$attack"
+    _clean_attacks
+    ok "Done: $attack"
+done
+
+# ── pairwise captures (optional) ──────────────────────────────────────────────
+if $DO_PAIRS; then
+    section "Pairwise captures"
+    n=${#SELECTED_ATTACKS[@]}
+    for (( i=0; i<n; i++ )); do
+        for (( j=i+1; j<n; j++ )); do
+            a="${SELECTED_ATTACKS[$i]}"
+            b="${SELECTED_ATTACKS[$j]}"
+            label="${a}_${b}"
+            info "Pair: $a + $b"
+            _ensure_clean
+            _install_attacks "$a" "$b"
+            _capture "$label" "$OUTPUT_DIR/pairs/$label" "$a $b"
+            _clean_attacks
+            ok "Done: $label"
+        done
+    done
+fi
+
+# ── final cleanup ─────────────────────────────────────────────────────────────
+section "Final cleanup"
+_ensure_clean
+ok "All captures complete."
+info "Manifest: $MANIFEST"
+info "Total captures recorded: $(wc -l < "$MANIFEST" 2>/dev/null || echo '(dry-run)')"
