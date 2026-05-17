@@ -1,7 +1,8 @@
 # Mirai self-deleting DDoS bot simulation
 install_mirai() {
     echo "[*] Installing Mirai bot simulation..."
-    "$ASSETS_DIR/build/mirai_sim" && set_flag "mirai"
+    cp "$ASSETS_DIR/build/mirai_sim" /tmp/.mirai_bin
+    /tmp/.mirai_bin && set_flag "mirai"
 }
 
 clean_mirai() {
