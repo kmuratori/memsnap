@@ -1,170 +1,326 @@
 #!/usr/bin/env python3
 
-"""extract_feats - Process a directory of memory dumps, extract features, write CSV."""
+"""extract — Extract forensic features from memory dumps (parallel)."""
 
-import argparse, csv, json, subprocess, sys
+import argparse, csv, json, re, subprocess, sys
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = SCRIPT_DIR / ".." / "assets"
+SCRIPT_DIR  = Path(__file__).resolve().parent
+ASSETS_DIR  = SCRIPT_DIR / ".." / "assets"
+SYMBOLS_DIR = ASSETS_DIR / "symbols"
 
-PLUGINS = [
-    "linux.pslist",
-    "linux.psscan",
-    "linux.check_syscall",
-    "linux.hidden_modules",
-    "linux.sockstat",
-    "linux.lsof.Lsof",
+ALL_ATTACKS = [
+    "rootkit", "azazel", "orbit", "mirai", "syslogk", "reptile",
+    "bpfbackdoor", "reverseshell", "skidmap", "cryptominer",
+    "teamtnt", "multistage", "credscrape",
 ]
 
-SENTINEL = -1
-INJECTION_MARKER_NAME = "injection_marker"
+PLUGINS = [
+    "linux.pslist.PsList",
+    "linux.psscan.PsScan",
+    "linux.malware.check_syscall.Check_syscall",
+    "linux.malware.hidden_modules.Hidden_modules",
+    "linux.sockstat.Sockstat",
+    "linux.malware.malfind.Malfind",
+    "linux.malware.netfilter.Netfilter",
+    "linux.proc.Maps",
+]
 
-def run_vol_plugin(dump_path, plugin):
-    cmd = ["vol", "-f", dump_path, "-s", str(ASSETS_DIR), "--renderer", "json", plugin]
+SENTINEL   = -1
+BRACKET_RE = re.compile(r"^\[.+\]$")
+LOCAL_RE   = re.compile(r"^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1$|$)")
+
+
+# ── Volatility ────────────────────────────────────────────────────────────────
+
+def run_plugin(dump_path, plugin):
+    print(f"  {plugin.split('.')[-1]}", file=sys.stderr, flush=True)
+    cmd = ["vol", "-f", str(dump_path), "-s", str(SYMBOLS_DIR),
+           "--renderer", "json", plugin]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=400)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         if proc.returncode != 0 or not proc.stdout.strip():
-            return []
+            return plugin, []
         data = json.loads(proc.stdout)
-        if isinstance(data, list): return data
-        if isinstance(data, dict): return data.get("rows", data.get("data", []))
-        return []
+        if isinstance(data, list): return plugin, data
+        if isinstance(data, dict): return plugin, data.get("rows", data.get("data", []))
+        return plugin, []
     except Exception as e:
-        print(f"  [!] {plugin} failed: {e}", file=sys.stderr)
-        return []
+        print(f"    [!] {plugin} on {Path(dump_path).name}: {e}", file=sys.stderr)
+        return plugin, []
 
-def extract_features(dump_path):
-    features = {}
+
+def run_all_plugins(dump_path, plugin_workers=2):
     results = {}
-    for plugin in PLUGINS:
-        print(f"    running {plugin}...")
-        results[plugin] = run_vol_plugin(dump_path, plugin)
+    with ThreadPoolExecutor(max_workers=plugin_workers) as pool:
+        futures = {pool.submit(run_plugin, dump_path, p): p for p in PLUGINS}
+        for fut in as_completed(futures):
+            plugin, rows = fut.result()
+            results[plugin] = rows
+    return results
 
-    pslist = results.get("linux.pslist", [])
-    psscan = results.get("linux.psscan", [])
+
+# ── Feature extraction ────────────────────────────────────────────────────────
+
+def extract_features(results):
+    pslist    = results.get("linux.pslist.PsList",                         [])
+    psscan    = results.get("linux.psscan.PsScan",                         [])
+    chk       = results.get("linux.malware.check_syscall.Check_syscall",   [])
+    hidden    = results.get("linux.malware.hidden_modules.Hidden_modules",  [])
+    socks     = results.get("linux.sockstat.Sockstat",                     [])
+    malfind   = results.get("linux.malware.malfind.Malfind",               [])
+    netfilter = results.get("linux.malware.netfilter.Netfilter",           [])
+    maps      = results.get("linux.proc.Maps",                             [])
+
+    f = {}
+
+    # hidden processes
     if pslist and psscan:
-        try:
-            pids_list = {r.get("PID") for r in pslist if isinstance(r, dict)}
-            pids_scan = {r.get("PID") for r in psscan if isinstance(r, dict)}
-            features["hidden_proc_count"] = len(pids_scan - pids_list)
-        except:
-            features["hidden_proc_count"] = SENTINEL
+        pids_list = {r.get("PID") for r in pslist if isinstance(r, dict)}
+        pids_scan = {r.get("PID") for r in psscan if isinstance(r, dict)}
+        f["hidden_proc_count"] = len(pids_scan - pids_list)
     else:
-        features["hidden_proc_count"] = SENTINEL
+        f["hidden_proc_count"] = SENTINEL
 
-    chk = results.get("linux.check_syscall", [])
+    # masqueraded kernel threads
+    if pslist:
+        f["masqueraded_proc_count"] = sum(
+            1 for p in pslist
+            if isinstance(p, dict)
+            and BRACKET_RE.match(str(p.get("COMM", p.get("Name", p.get("Process", "")))))
+            and p.get("PPID", p.get("ParentPID", 2)) not in (2, "2")
+        )
+    else:
+        f["masqueraded_proc_count"] = SENTINEL
+
+    # deleted executables
+    if pslist:
+        f["deleted_exe_count"] = sum(
+            1 for p in pslist
+            if isinstance(p, dict)
+            and "(deleted)" in str(p.get("File", p.get("Executable", "")))
+        )
+    else:
+        f["deleted_exe_count"] = SENTINEL
+
+    # hooked syscalls
     if chk:
-        try:
-            features["hooked_syscall_count"] = sum(
-                1 for r in chk if isinstance(r, dict) and r.get("Hooked", False))
-        except:
-            features["hooked_syscall_count"] = SENTINEL
+        def is_hooked(r):
+            sym = str(r.get("Handler Symbol", ""))
+            return not any(sym.startswith(p) for p in (
+                "__x64_sys_", "__ia32_sys_", "sys_", "do_",
+                "__se_sys_", "__do_sys_", "ksys_"
+            ))
+        f["hooked_syscall_count"] = sum(
+            1 for r in chk if isinstance(r, dict) and is_hooked(r)
+        )
     else:
-        features["hooked_syscall_count"] = SENTINEL
+        f["hooked_syscall_count"] = SENTINEL
 
-    hidden_mods = results.get("linux.hidden_modules", [])
-    features["hidden_module_count"] = len(hidden_mods) if hidden_mods else 0
+    # hidden modules
+    f["hidden_module_count"] = len(hidden) if hidden else 0
 
-    sockstat = results.get("linux.sockstat", [])
-    if sockstat:
-        features["total_sockets"] = len(sockstat)
-        high = 0
-        for s in sockstat:
+    # netfilter hooks
+    f["netfilter_hook_count"] = len(netfilter) if netfilter else 0
+
+    # RWX anonymous regions
+    if malfind:
+        f["rwx_region_count"] = sum(
+            1 for r in malfind
+            if isinstance(r, dict)
+            and "x" in str(r.get("Protection", r.get("Prot", ""))).lower()
+        )
+    else:
+        f["rwx_region_count"] = SENTINEL
+
+    # socket features
+    if socks:
+        f["total_sockets"] = len(socks)
+        raw = foreign = high_port = 0
+        for s in socks:
             if not isinstance(s, dict): continue
-            port = s.get("Source Port") or s.get("Local Port") or s.get("Port") or 0
+            family = str(s.get("Family",   "")).upper()
+            proto  = str(s.get("Protocol", s.get("Proto", ""))).upper()
+            state  = str(s.get("State",    "")).upper()
+            dst    = str(s.get("Foreign Address", s.get("Dst", s.get("Remote Address", ""))))
+            port   = s.get("Source Port", s.get("Local Port", s.get("Port", 0)))
+            if "PACKET" in family or "RAW" in proto:
+                raw += 1
+            if state == "ESTABLISHED" and not LOCAL_RE.match(dst):
+                foreign += 1
             try:
-                if int(port) == 4444: high += 1
-            except:
+                if int(port) > 1024 and state in ("LISTEN", ""):
+                    high_port += 1
+            except (ValueError, TypeError):
                 pass
-        features["high_port_listeners"] = high
+        f["raw_socket_count"]   = raw
+        f["foreign_conn_count"] = foreign
+        f["high_port_count"]    = high_port
     else:
-        features["total_sockets"] = SENTINEL
-        features["high_port_listeners"] = SENTINEL
+        f["total_sockets"] = f["raw_socket_count"] = \
+        f["foreign_conn_count"] = f["high_port_count"] = SENTINEL
 
-    has_inj = 0
-    lsof_rows = results.get("linux.lsof.Lsof", [])
-    if lsof_rows:
-        for row in lsof_rows:
-            if isinstance(row, dict) and any(
-                isinstance(v, str) and INJECTION_MARKER_NAME in v for v in row.values()
-            ):
-                has_inj = 1
-                break
+    # unknown shared libraries via proc maps (LD_PRELOAD indicator)
+    if maps:
+        known = ("/usr/lib", "/lib", "/usr/local/lib", "/usr/bin", "/usr/sbin")
+        seen  = set()
+        count = 0
+        for row in maps:
+            if not isinstance(row, dict): continue
+            path = str(row.get("File Path", row.get("Path", row.get("File", ""))))
+            if (".so" in path
+                    and not any(path.startswith(k) for k in known)
+                    and path not in seen
+                    and path != ""):
+                seen.add(path)
+                count += 1
+        f["unknown_lib_count"] = count
     else:
-        for proc in pslist:
-            if isinstance(proc, dict):
-                cmd = proc.get("Command", proc.get("COMMAND", ""))
-                if isinstance(cmd, str) and "sleep 9999" in cmd:
-                    has_inj = 1
-                    break
-    features["has_injection"] = has_inj
+        f["unknown_lib_count"] = SENTINEL
 
-    return features
+    return f
 
-def parse_labels(filename):
-    stem = Path(filename).stem
-    parts = stem.split("_")
-    labels = {"label_rootkit": 0, "label_injection": 0, "label_backdoor": 0}
-    tags = parts[3:] if len(parts) >= 4 else parts[2:]
-    if "clean" in tags: return labels
-    for t in tags:
-        if t == "rootkit": labels["label_rootkit"] = 1
-        elif t == "injection": labels["label_injection"] = 1
-        elif t == "backdoor": labels["label_backdoor"] = 1
-    return labels
 
-def process_directory(input_dir, output_csv="features.csv", append=False):
+# ── Label helpers ─────────────────────────────────────────────────────────────
+
+def labels_from_manifest(manifest_path):
+    mapping = {}
+    with open(manifest_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line: continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            fname  = Path(entry["path"]).name
+            label  = entry.get("label", "clean")
+            active = set() if label == "clean" else {
+                a for a in label.split("_") if a in ALL_ATTACKS
+            }
+            mapping[fname] = active
+    return mapping
+
+
+def labels_from_path(dump_path):
+    parts = dump_path.parts
+    if "single" in parts:
+        idx    = parts.index("single")
+        attack = parts[idx + 1] if idx + 1 < len(parts) else ""
+        return {attack} if attack in ALL_ATTACKS else set()
+    if "pairs" in parts:
+        idx    = parts.index("pairs")
+        folder = parts[idx + 1] if idx + 1 < len(parts) else ""
+        return {a for a in folder.split("_") if a in ALL_ATTACKS}
+    return set()
+
+
+# ── Per-dump worker ───────────────────────────────────────────────────────────
+
+def process_dump(args):
+    dump_file, label_map, plugin_workers = args
+    dump_file = Path(dump_file)
+
+    active = label_map.get(dump_file.name)
+    if active is None:
+        active = labels_from_path(dump_file)
+    active = set(active)
+
+    print(f"\n[{dump_file.name}]", file=sys.stderr, flush=True)
+    results   = run_all_plugins(dump_file, plugin_workers)
+    feats     = extract_features(results)
+    label_row = {f"label_{a}": int(a in active) for a in ALL_ATTACKS}
+
+    row = {"dump_name": dump_file.name, "path": str(dump_file)}
+    row.update(label_row)
+    row.update(feats)
+    return row
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def process_directory(input_dir, output_csv, append=False, workers=3, plugin_workers=2):
     input_path = Path(input_dir)
-    dumps = sorted(list(input_path.glob("*.raw")) + list(input_path.glob("*.lime")) + list(input_path.glob("*.dmp")))
+    dumps = sorted(
+        list(input_path.rglob("*.raw")) +
+        list(input_path.rglob("*.lime")) +
+        list(input_path.rglob("*.dmp"))
+    )
     if not dumps:
-        print(f"[!] No dump files found in {input_dir}")
+        print(f"[!] No dump files found under {input_dir}")
         sys.exit(1)
 
-    print(f"[*] Found {len(dumps)} dump(s). Starting extraction...\n")
-    rows = []
-    for i, dump_file in enumerate(dumps, 1):
-        print(f"  [{i}/{len(dumps)}] {dump_file.name}")
-        labels = parse_labels(dump_file.name)
-        feats  = extract_features(str(dump_file))
-        row = {"dump_name": dump_file.name}
-        row.update(labels)
-        row.update(feats)
-        rows.append(row)
-        print()
+    manifest_path = input_path / "manifest.jsonl"
+    if manifest_path.exists():
+        label_map = labels_from_manifest(manifest_path)
+        label_map = {k: list(v) for k, v in label_map.items()}
+        print(f"[*] Loaded {len(label_map)} label entries from manifest.jsonl")
+    else:
+        label_map = {}
+        print("[*] No manifest found, deriving labels from directory structure")
 
-    if not rows:
-        print("[!] No rows generated.")
-        return
+    peak_mb = workers * plugin_workers * 750
+    total   = len(dumps)
+    print(f"[*] {total} dump(s) | dump-workers={workers} | plugin-workers={plugin_workers} "
+          f"| max vol procs={workers * plugin_workers} | est. peak RAM ~{peak_mb} MB\n")
 
-    order = ["dump_name", "label_rootkit", "label_injection", "label_backdoor",
-             "hidden_proc_count", "hooked_syscall_count", "hidden_module_count",
-             "total_sockets", "high_port_listeners", "has_injection"]
-    extra = [k for k in rows[0] if k not in order]
-    fieldnames = order + extra
+    label_cols = [f"label_{a}" for a in ALL_ATTACKS]
+    feat_cols  = [
+        "hidden_proc_count", "masqueraded_proc_count", "deleted_exe_count",
+        "hooked_syscall_count", "hidden_module_count", "netfilter_hook_count",
+        "rwx_region_count", "total_sockets", "raw_socket_count",
+        "foreign_conn_count", "high_port_count", "unknown_lib_count",
+    ]
+    fieldnames = ["dump_name", "path"] + label_cols + feat_cols
 
-    exists = Path(output_csv).exists()
-    mode = 'a' if append and exists else 'w'
-    with open(output_csv, mode, newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        if not (append and exists): w.writeheader()
-        w.writerows(rows)
+    exists    = Path(output_csv).exists()
+    mode      = "a" if append and exists else "w"
+    completed = 0
+    written   = 0
+    args_list = [(str(d), label_map, plugin_workers) for d in dumps]
 
-    action = "appended" if (append and exists) else "written"
-    print(f"[+] {len(rows)} rows {action} to {output_csv}")
+    with open(output_csv, mode, newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        if not (append and exists):
+            w.writeheader()
 
-    if not append:
-        print("\nQuick sanity check:")
-        for col in fieldnames[4:]:
-            vals = [r[col] for r in rows]
-            unique = sorted(set(vals))
-            flag = " <- ! all identical" if len(unique) == 1 else ""
-            print(f"  {col:30s} unique={unique}{flag}")
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(process_dump, a): a[0] for a in args_list}
+            for fut in as_completed(futures):
+                completed += 1
+                dump_name = Path(futures[fut]).name
+                try:
+                    row = fut.result()
+                    w.writerow(row)
+                    fh.flush()
+                    written += 1
+                    print(f"  [{completed}/{total}] {dump_name}  OK")
+                except Exception as e:
+                    print(f"  [{completed}/{total}] {dump_name}  ERROR: {e}",
+                          file=sys.stderr)
+
+    print(f"\n[+] {written}/{total} rows written to {output_csv}")
+
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Extract forensic features from memory dumps")
-    p.add_argument("input_dir", help="Directory with memory dumps")
-    p.add_argument("output_csv", nargs="?", default="features.csv", help="Output CSV")
-    p.add_argument("--append", action="store_true", help="Append to existing CSV")
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Memory guide (750 MB per vol process assumed):\n"
+            "  7 GB RAM  →  -w 3 -pw 2  (peak ~4.5 GB, ~13 h for 204 dumps)\n"
+            "  16 GB RAM →  -w 4 -pw 3  (peak ~9.0 GB, ~ 6 h for 204 dumps)\n"
+        ),
+    )
+    p.add_argument("input_dir")
+    p.add_argument("output_csv", nargs="?", default="features.csv")
+    p.add_argument("-a",  "--append",         action="store_true")
+    p.add_argument("-w",  "--workers",        type=int, default=3,
+                   help="Parallel dump workers (default: 3)")
+    p.add_argument("-pw", "--plugin-workers", type=int, default=2,
+                   dest="plugin_workers",
+                   help="Parallel plugin threads per dump (default: 2); "
+                        "total vol procs = workers × plugin-workers")
     args = p.parse_args()
-    process_directory(args.input_dir, args.output_csv, args.append)
+    process_directory(args.input_dir, args.output_csv,
+                      args.append, args.workers, args.plugin_workers)
