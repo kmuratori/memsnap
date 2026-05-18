@@ -1,52 +1,185 @@
 #!/usr/bin/env python3
 
-"""Train a multi-output Decision Tree classifier on features.csv."""
+"""Train a multi-output Random Forest classifier on features.csv."""
 
 import argparse, sys
 from pathlib import Path
+
 import pandas as pd
-from sklearn.tree import DecisionTreeClassifier
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.multioutput import MultiOutputClassifier
-from sklearn.model_selection import LeaveOneOut, cross_val_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
 import joblib
+
+# ── Column definitions ────────────────────────────────────────────────────────
+
+# Zero-variance features confirmed from data audit — drop entirely
+DEAD_FEATURES = [
+    "deleted_exe_count",       # always 0
+    "hooked_syscall_count",    # always 0  (Check_syscall bug)
+    "foreign_conn_count",      # always 0
+    "high_port_count",         # always 24
+    "netfilter_hook_count",    # always 2
+]
+
+FEATURES = [
+    "hidden_proc_count",
+    "masqueraded_proc_count",
+    "hidden_module_count",
+    "rwx_region_count",
+    "total_sockets",
+    "raw_socket_count",
+    "unknown_lib_count",
+]
+
+LABELS = [
+    "label_rootkit", "label_azazel",      "label_orbit",    "label_mirai",
+    "label_syslogk", "label_reptile",     "label_bpfbackdoor",
+    "label_reverseshell", "label_skidmap", "label_cryptominer",
+    "label_teamtnt", "label_multistage",  "label_credscrape",
+]
+
+SENTINEL = -1
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def load_and_clean(csv_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df = pd.read_csv(csv_path)
+
+    missing = [c for c in FEATURES + LABELS if c not in df.columns]
+    if missing:
+        print(f"[!] Missing expected columns: {missing}", file=sys.stderr)
+        sys.exit(1)
+
+    X = df[FEATURES].copy()
+    y = df[LABELS].copy()
+
+    # Impute sentinels with column median (only rwx_region_count and
+    # unknown_lib_count have any; 5 rows total)
+    sentinel_counts = (X == SENTINEL).sum()
+    sentinel_cols   = sentinel_counts[sentinel_counts > 0]
+    if not sentinel_cols.empty:
+        print("[*] Imputing sentinel (-1) values:")
+        for col in sentinel_cols.index:
+            median = X.loc[X[col] != SENTINEL, col].median()
+            n      = sentinel_counts[col]
+            X.loc[X[col] == SENTINEL, col] = median
+            print(f"    {col}: {n} row(s) → median {median:.0f}")
+
+    return X, y
+
+
+def sample_weight_from_labels(y: pd.DataFrame) -> np.ndarray:
+    """Down-weight clean samples so the 9-vs-195 imbalance doesn't dominate."""
+    is_clean = (y == 0).all(axis=1)
+    n_infected = (~is_clean).sum()
+    n_clean    = is_clean.sum()
+    ratio      = n_infected / n_clean if n_clean else 1.0
+    weights    = np.where(is_clean, ratio, 1.0)
+    print(f"[*] Class weights: infected=1.0  clean={ratio:.1f}  "
+          f"(n_infected={n_infected}, n_clean={n_clean})")
+    return weights
+
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+
+def evaluate(X: pd.DataFrame, y: pd.DataFrame, weights: np.ndarray):
+    """Stratified 5-fold CV. Stratify on a combined any-attack binary label."""
+    strat_label = (y == 1).any(axis=1).astype(int)
+
+    print("\n[*] Stratified 5-fold CV — per-label F1:")
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    f1s = {}
+    for label in LABELS:
+        fold_scores = []
+        for train_idx, test_idx in skf.split(X, strat_label):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y[label].iloc[train_idx], y[label].iloc[test_idx]
+            w_train = weights[train_idx]
+
+            inner_clf = RandomForestClassifier(
+                n_estimators=200, max_depth=6, min_samples_leaf=3,
+                class_weight="balanced", random_state=42, n_jobs=-1
+            )
+            inner_clf.fit(X_train, y_train, sample_weight=w_train)
+            y_pred = inner_clf.predict(X_test)
+            fold_scores.append(f1_score(y_test, y_pred, zero_division=0))
+
+        mean_f1 = np.mean(fold_scores)
+        f1s[label] = mean_f1
+        bar = "█" * int(mean_f1 * 20)
+        print(f"  {label.replace('label_', ''):20s} {mean_f1:.3f}  {bar}")
+
+    mean_all = np.mean(list(f1s.values()))
+    print(f"\n  {'macro mean':20s} {mean_all:.3f}")
+    return f1s
+
+
+# ── Feature importance ───────────────────────────────────────────────────────
+
+def print_importances(clf, feature_names):
+    imps = np.mean(
+        [est.feature_importances_ for est in clf.estimators_], axis=0
+    )
+    print("\n[*] Mean feature importances (across all labels):")
+    for feat, imp in sorted(zip(feature_names, imps), key=lambda x: -x[1]):
+        bar = "█" * int(imp * 40)
+        print(f"  {feat:30s} {imp:.3f}  {bar}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Train the detection model")
-    p.add_argument("-i", "--input", required=True, help="Path to features CSV")
-    p.add_argument("-o", "--output", default="model.pkl", help="Where to save the trained model")
+    p.add_argument("-i", "--input",  required=True, help="Path to features CSV")
+    p.add_argument("-o", "--output", default="model.pkl",
+                   help="Where to save the trained model (default: model.pkl)")
+    p.add_argument("--no-eval", action="store_true",
+                   help="Skip CV evaluation (faster, just fit and save)")
     args = p.parse_args()
 
     if not Path(args.input).exists():
-        print(f"Error: file not found: {args.input}")
+        print(f"[!] File not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    df = pd.read_csv(args.input)
-    FEATURES = ["hidden_module_count", "has_injection", "high_port_listeners", "total_sockets"]
-    LABELS   = ["label_rootkit", "label_injection", "label_backdoor"]
-    X = df[FEATURES]
-    y = df[LABELS]
+    print(f"[*] Loading {args.input}")
+    X, y = load_and_clean(args.input)
+    print(f"[*] {len(X)} samples  |  {len(FEATURES)} features  |  {len(LABELS)} labels")
+    print(f"[*] Dropped zero-variance features: {', '.join(DEAD_FEATURES)}")
 
-    loo = LeaveOneOut()
-    print("Per-label LOO accuracy:")
-    for label in LABELS:
-        clf = DecisionTreeClassifier(random_state=42)
-        scores = cross_val_score(clf, X, y[label], cv=loo, scoring="accuracy")
-        print(f"  {label}: {scores.mean():.2f}")
+    weights = sample_weight_from_labels(y)
 
-    clf_multi = MultiOutputClassifier(DecisionTreeClassifier(random_state=42))
-    exact = cross_val_score(clf_multi, X, y, cv=loo, scoring="accuracy")
-    print(f"Exact match accuracy: {exact.mean():.2f}")
+    base_clf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=6,
+        min_samples_leaf=3,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,
+    )
 
-    clf_multi.fit(X, y)
-    joblib.dump(clf_multi, args.output)
-    print(f"Model saved to {args.output}")
+    if not args.no_eval:
+        evaluate(X, y, weights)
 
-    print("\nLearned rules:")
-    for est, label in zip(clf_multi.estimators_, LABELS):
-        tree = est.tree_
-        if tree.node_count > 1:
-            feat = FEATURES[tree.feature[0]]
-            thresh = tree.threshold[0]
-            print(f"  {label}: {feat} <= {thresh:.1f}")
-        else:
-            print(f"  {label}: constant leaf")
+    # Final fit on full dataset
+    print("\n[*] Fitting final model on full dataset...")
+    clf = MultiOutputClassifier(base_clf)
+    # Initialize estimators_ first (required by some sklearn versions)
+    clf.fit(X, y)
+    # Re-fit each estimator with per-sample weights
+    for est, label in zip(clf.estimators_, LABELS):
+        est.fit(X, y[label], sample_weight=weights)
+
+    print_importances(clf, FEATURES)
+
+    out = Path(args.output)
+    meta = {
+        "model":    clf,
+        "features": FEATURES,
+        "labels":   LABELS,
+    }
+    joblib.dump(meta, out)
+    print(f"\n[+] Saved to {out}  (keys: model, features, labels)")

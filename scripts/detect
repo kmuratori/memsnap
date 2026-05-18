@@ -1,94 +1,337 @@
 #!/usr/bin/env python3
 
-"""Detect rootkit / injection / backdoor from a single memory dump."""
+"""Detect malware families from a single Linux memory dump."""
 
-import argparse, json, subprocess, sys
+import argparse, json, re, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
 import joblib
 import pandas as pd
+import numpy as np
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL = SCRIPT_DIR / ".." / "assets" / "model.pkl"
-ASSETS_DIR = SCRIPT_DIR / ".." / "assets"
+SCRIPT_DIR  = Path(__file__).resolve().parent
+ASSETS_DIR  = SCRIPT_DIR / ".." / "assets"
+SYMBOLS_DIR = ASSETS_DIR / "symbols"
+DEFAULT_MODEL = ASSETS_DIR / "ai-model" / "model.pkl"
 
 PLUGINS = [
-    "linux.pslist",
-    "linux.psscan",
-    "linux.hidden_modules",
-    "linux.sockstat",
-    "linux.lsof.Lsof",
+    "linux.pslist.PsList",
+    "linux.psscan.PsScan",
+    "linux.malware.check_syscall.Check_syscall",
+    "linux.malware.hidden_modules.Hidden_modules",
+    "linux.sockstat.Sockstat",
+    "linux.malware.malfind.Malfind",
+    "linux.malware.netfilter.Netfilter",
+    "linux.proc.Maps",
 ]
-SENTINEL = -1
+
+SENTINEL   = -1
+BRACKET_RE = re.compile(r"^\[.+\]$")
+LOCAL_RE   = re.compile(r"^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1$|$)")
+
+# Medians computed from the training set — must match train-time imputation
+TRAINING_MEDIANS = {
+    "rwx_region_count": 8,
+    "unknown_lib_count": 0,
+}
+
+
+# ── Volatility (identical to extract) ─────────────────────────────────────────
 
 def run_plugin(dump_path, plugin):
-    cmd = ["vol", "-f", dump_path, "-s", str(ASSETS_DIR), "--renderer", "json", plugin]
+    print(f"  {plugin.split('.')[-1]}", file=sys.stderr, flush=True)
+    cmd = ["vol", "-f", str(dump_path), "-s", str(SYMBOLS_DIR),
+           "--renderer", "json", plugin]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=400)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         if proc.returncode != 0 or not proc.stdout.strip():
-            return []
+            return plugin, []
         data = json.loads(proc.stdout)
-        if isinstance(data, list): return data
-        if isinstance(data, dict): return data.get("rows", data.get("data", []))
-        return []
-    except:
-        return []
+        if isinstance(data, list): return plugin, data
+        if isinstance(data, dict): return plugin, data.get("rows", data.get("data", []))
+        return plugin, []
+    except Exception as e:
+        print(f"    [!] {plugin} on {Path(dump_path).name}: {e}", file=sys.stderr)
+        return plugin, []
 
-def extract_features(dump_path):
+
+def run_all_plugins(dump_path, plugin_workers=2):
     results = {}
-    for plugin in PLUGINS:
-        results[plugin] = run_plugin(dump_path, plugin)
+    with ThreadPoolExecutor(max_workers=plugin_workers) as pool:
+        futures = {pool.submit(run_plugin, dump_path, p): p for p in PLUGINS}
+        for fut in as_completed(futures):
+            plugin, rows = fut.result()
+            results[plugin] = rows
+    return results
 
-    hidden_mods = results.get("linux.hidden_modules", [])
-    hmod = len(hidden_mods) if hidden_mods else 0
 
-    has_inj = 0
-    lsof_rows = results.get("linux.lsof.Lsof", [])
-    if lsof_rows:
-        for row in lsof_rows:
-            if isinstance(row, dict) and any(
-                isinstance(v, str) and "injection_marker" in v for v in row.values()
-            ):
-                has_inj = 1
-                break
+# ── Feature extraction (identical to extract) ─────────────────────────────────
 
-    sockstat = results.get("linux.sockstat", [])
-    high_port = 0
-    total_sock = len(sockstat) if sockstat else SENTINEL
-    if sockstat:
-        for s in sockstat:
+def extract_features(results):
+    pslist    = results.get("linux.pslist.PsList",                         [])
+    psscan    = results.get("linux.psscan.PsScan",                         [])
+    chk       = results.get("linux.malware.check_syscall.Check_syscall",   [])
+    hidden    = results.get("linux.malware.hidden_modules.Hidden_modules",  [])
+    socks     = results.get("linux.sockstat.Sockstat",                     [])
+    malfind   = results.get("linux.malware.malfind.Malfind",               [])
+    netfilter = results.get("linux.malware.netfilter.Netfilter",           [])
+    maps      = results.get("linux.proc.Maps",                             [])
+
+    f = {}
+
+    # hidden processes
+    if pslist and psscan:
+        pids_list = {r.get("PID") for r in pslist if isinstance(r, dict)}
+        pids_scan = {r.get("PID") for r in psscan if isinstance(r, dict)}
+        f["hidden_proc_count"] = len(pids_scan - pids_list)
+    else:
+        f["hidden_proc_count"] = SENTINEL
+
+    # masqueraded kernel threads
+    if pslist:
+        f["masqueraded_proc_count"] = sum(
+            1 for p in pslist
+            if isinstance(p, dict)
+            and BRACKET_RE.match(str(p.get("COMM", p.get("Name", p.get("Process", "")))))
+            and p.get("PPID", p.get("ParentPID", 2)) not in (2, "2")
+        )
+    else:
+        f["masqueraded_proc_count"] = SENTINEL
+
+    # deleted executables
+    if pslist:
+        f["deleted_exe_count"] = sum(
+            1 for p in pslist
+            if isinstance(p, dict)
+            and "(deleted)" in str(p.get("File", p.get("Executable", "")))
+        )
+    else:
+        f["deleted_exe_count"] = SENTINEL
+
+    # hooked syscalls
+    if chk:
+        def is_hooked(r):
+            sym = str(r.get("Handler Symbol", ""))
+            return not any(sym.startswith(p) for p in (
+                "__x64_sys_", "__ia32_sys_", "sys_", "do_",
+                "__se_sys_", "__do_sys_", "ksys_"
+            ))
+        f["hooked_syscall_count"] = sum(
+            1 for r in chk if isinstance(r, dict) and is_hooked(r)
+        )
+    else:
+        f["hooked_syscall_count"] = SENTINEL
+
+    # hidden modules
+    f["hidden_module_count"] = len(hidden) if hidden else 0
+
+    # netfilter hooks
+    f["netfilter_hook_count"] = len(netfilter) if netfilter else 0
+
+    # RWX anonymous regions
+    if malfind:
+        f["rwx_region_count"] = sum(
+            1 for r in malfind
+            if isinstance(r, dict)
+            and "x" in str(r.get("Protection", r.get("Prot", ""))).lower()
+        )
+    else:
+        f["rwx_region_count"] = SENTINEL
+
+    # socket features
+    if socks:
+        f["total_sockets"] = len(socks)
+        raw = foreign = high_port = 0
+        for s in socks:
             if not isinstance(s, dict): continue
-            port = s.get("Source Port") or s.get("Local Port") or s.get("Port") or 0
+            family = str(s.get("Family",   "")).upper()
+            proto  = str(s.get("Protocol", s.get("Proto", ""))).upper()
+            state  = str(s.get("State",    "")).upper()
+            dst    = str(s.get("Foreign Address", s.get("Dst", s.get("Remote Address", ""))))
+            port   = s.get("Source Port", s.get("Local Port", s.get("Port", 0)))
+            if "PACKET" in family or "RAW" in proto:
+                raw += 1
+            if state == "ESTABLISHED" and not LOCAL_RE.match(dst):
+                foreign += 1
             try:
-                if int(port) == 4444: high_port += 1
-            except:
+                if int(port) > 1024 and state in ("LISTEN", ""):
+                    high_port += 1
+            except (ValueError, TypeError):
                 pass
+        f["raw_socket_count"]   = raw
+        f["foreign_conn_count"] = foreign
+        f["high_port_count"]    = high_port
+    else:
+        f["total_sockets"] = f["raw_socket_count"] = \
+        f["foreign_conn_count"] = f["high_port_count"] = SENTINEL
 
-    return pd.DataFrame([{
-        "hidden_module_count": hmod,
-        "has_injection": has_inj,
-        "high_port_listeners": high_port,
-        "total_sockets": total_sock,
-    }])
+    # unknown shared libraries via proc maps (LD_PRELOAD indicator)
+    if maps:
+        known = ("/usr/lib", "/lib", "/usr/local/lib", "/usr/bin", "/usr/sbin")
+        seen  = set()
+        count = 0
+        for row in maps:
+            if not isinstance(row, dict): continue
+            path = str(row.get("File Path", row.get("Path", row.get("File", ""))))
+            if (".so" in path
+                    and not any(path.startswith(k) for k in known)
+                    and path not in seen
+                    and path != ""):
+                seen.add(path)
+                count += 1
+        f["unknown_lib_count"] = count
+    else:
+        f["unknown_lib_count"] = SENTINEL
+
+    return f
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def impute_sentinels(X: pd.DataFrame) -> pd.DataFrame:
+    """Replace sentinel (-1) values with training medians; any leftover -> 0."""
+    X = X.copy()
+    for col, median in TRAINING_MEDIANS.items():
+        if col in X.columns:
+            X.loc[X[col] == SENTINEL, col] = median
+    X = X.replace(SENTINEL, 0)
+    return X
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Detect malware components from a memory dump")
+    p = argparse.ArgumentParser(
+        description="Detect malware families from a Linux memory dump"
+    )
     p.add_argument("dump", help="Path to memory dump")
-    p.add_argument("-m", "--model", default=str(DEFAULT_MODEL), help="Path to model.pkl")
+    p.add_argument("-m", "--model", default=str(DEFAULT_MODEL),
+                   help="Path to model.pkl (default: assets/ai-model/model.pkl)")
+    p.add_argument("-t", "--threshold", type=float, default=0.5,
+                   help="Probability threshold for detection (default: 0.5)")
+    p.add_argument("--json", action="store_true",
+                   help="Emit machine-readable JSON instead of table")
+    p.add_argument("-pw", "--plugin-workers", type=int, default=2,
+                   dest="plugin_workers",
+                   help="Parallel plugin threads (default: 2)")
     args = p.parse_args()
 
-    if not Path(args.dump).exists():
-        print(f"Error: file not found: {args.dump}")
+    dump_path = Path(args.dump)
+    if not dump_path.exists():
+        print(f"[!] File not found: {args.dump}")
         sys.exit(1)
 
-    print("Extracting features...")
-    X_new = extract_features(args.dump)
+    # ── Load model ──────────────────────────────────────────────────────────
+    try:
+        meta = joblib.load(args.model)
+    except FileNotFoundError:
+        print(f"[!] Model not found at {args.model}. Run train first.")
+        sys.exit(1)
+
+    if isinstance(meta, dict):
+        model = meta["model"]
+        feature_names = meta.get("features")
+        label_names = meta.get("labels")
+    else:
+        model = meta
+        feature_names = None
+        label_names = None
+
+    # ── Extract features ────────────────────────────────────────────────────
+    if not args.json:
+        print("[*] Running Volatility plugins...", file=sys.stderr)
+
+    results = run_all_plugins(args.dump, plugin_workers=args.plugin_workers)
+    feats = extract_features(results)
+    X_new = pd.DataFrame([feats])
+
+    # Align to the exact columns the model was trained on
+    if feature_names:
+        for col in feature_names:
+            if col not in X_new.columns:
+                X_new[col] = 0
+        X_new = X_new[feature_names]
+    else:
+        # Fallback — the 7 live features from training
+        expected = [
+            "hidden_proc_count", "masqueraded_proc_count", "hidden_module_count",
+            "rwx_region_count", "total_sockets", "raw_socket_count", "unknown_lib_count",
+        ]
+        for col in expected:
+            if col not in X_new.columns:
+                X_new[col] = 0
+        X_new = X_new[expected]
+
+    X_new = impute_sentinels(X_new)
+
+    if not args.json:
+        print("\n[*] Feature vector:")
+        for col in X_new.columns:
+            val = X_new[col].iloc[0]
+            print(f"    {col:30s}: {val}")
+
+    # ── Inference ───────────────────────────────────────────────────────────
+    pred = model.predict(X_new)[0]
 
     try:
-        model = joblib.load(args.model)
-    except FileNotFoundError:
-        print(f"Error: model not found at {args.model}. Train it first.")
-        sys.exit(1)
+        probas = model.predict_proba(X_new)
+        has_proba = True
+    except Exception:
+        probas = None
+        has_proba = False
 
-    pred = model.predict(X_new)[0]
-    for i, label in enumerate(["Rootkit", "Injection", "Backdoor"]):
-        print(f"{label:10}: {'detected' if pred[i] else 'not detected'}")
+    if label_names:
+        labels = [l.replace("label_", "") for l in label_names]
+    else:
+        labels = [
+            "rootkit", "azazel", "orbit", "mirai", "syslogk", "reptile",
+            "bpfbackdoor", "reverseshell", "skidmap", "cryptominer",
+            "teamtnt", "multistage", "credscrape",
+        ]
+
+    results_out = []
+    for i, label in enumerate(labels):
+        detected = bool(pred[i])
+        conf = None
+        if has_proba and i < len(probas):
+            arr = probas[i][0]
+            conf = float(arr[1]) if len(arr) > 1 else float(arr[0])
+        is_detected = detected or (conf is not None and conf >= args.threshold)
+        results_out.append({
+            "family": label,
+            "detected": is_detected,
+            "confidence": round(conf, 4) if conf is not None else None,
+        })
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    if args.json:
+        import json as _json
+        print(_json.dumps(results_out, indent=2))
+        sys.exit(0)
+
+    print("\n" + "=" * 56)
+    print(f"{'MALWARE FAMILY':20s} {'STATUS':12s} {'CONFIDENCE':>12s}")
+    print("=" * 56)
+
+    detected_families = []
+    for r in results_out:
+        label = r["family"]
+        is_positive = r["detected"]
+        conf = r["confidence"]
+        conf_str = f"{conf:>11.1%}" if conf is not None else "    —"
+        status = "DETECTED" if is_positive else "clean"
+        marker = "[!]" if is_positive else "[+]"
+        print(f"{marker} {label:17s} {status:12s} {conf_str}")
+        if is_positive:
+            detected_families.append(r)
+
+    print("=" * 56)
+
+    if detected_families:
+        print(f"\n[!] {len(detected_families)} malware family(s) flagged:")
+        for r in detected_families:
+            bar = "█" * int(r["confidence"] * 20) if r["confidence"] else ""
+            print(f"    • {r['family']:15s} {r['confidence']:>6.1%} {bar}")
+    else:
+        print("\n[+] No known malware families detected.")
