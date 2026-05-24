@@ -1,13 +1,4 @@
 dump_name,path,label_rootkit,label_azazel,label_orbit,label_mirai,label_syslogk,label_reptile,label_bpfbackdoor,label_reverseshell,label_skidmap,label_cryptominer,label_teamtnt,label_multistage,label_credscrape,hidden_proc_count,masqueraded_proc_count,deleted_exe_count,hooked_syscall_count,hidden_module_count,netfilter_hook_count,rwx_region_count,total_sockets,raw_socket_count,foreign_conn_count,high_port_count,unknown_lib_count
-memdump_20260517_193349_clean.raw,dumps_v2/clean/memdump_20260517_193349_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,22,1,0,0,1,2,1,264,4,0,24,0
-memdump_20260517_193107_clean.raw,dumps_v2/clean/memdump_20260517_193107_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,23,0,0,0,0,2,-1,264,4,0,24,0
-memdump_20260517_193629_clean.raw,dumps_v2/clean/memdump_20260517_193629_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,30,2,0,0,1,2,2,264,4,0,24,0
-memdump_20260517_194416_clean.raw,dumps_v2/clean/memdump_20260517_194416_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,27,5,0,0,1,2,5,264,4,0,24,0
-memdump_20260517_193904_clean.raw,dumps_v2/clean/memdump_20260517_193904_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,29,3,0,0,1,2,3,264,4,0,24,0
-memdump_20260517_194140_clean.raw,dumps_v2/clean/memdump_20260517_194140_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,27,4,0,0,1,2,4,264,4,0,24,0
-memdump_20260517_194651_clean.raw,dumps_v2/clean/memdump_20260517_194651_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,26,6,0,0,1,2,6,264,4,0,24,0
-memdump_20260517_194926_clean.raw,dumps_v2/clean/memdump_20260517_194926_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,23,7,0,0,1,2,7,264,4,0,24,0
-memdump_20260517_195201_clean.raw,dumps_v2/clean/memdump_20260517_195201_clean.raw,0,0,0,0,0,0,0,0,0,0,0,0,0,23,8,0,0,1,2,8,264,4,0,24,0
 memdump_20260517_195440_azazel_bpfbackdoor.raw,dumps_v2/pairs/azazel_bpfbackdoor/memdump_20260517_195440_azazel_bpfbackdoor.raw,0,1,0,0,0,0,1,0,0,0,0,0,0,22,10,0,0,1,2,11,265,5,0,24,1
 memdump_20260517_195503_azazel_cryptominer.raw,dumps_v2/pairs/azazel_cryptominer/memdump_20260517_195503_azazel_cryptominer.raw,0,1,0,0,0,0,0,0,0,1,0,0,0,24,9,0,0,1,2,10,264,4,0,24,1
 memdump_20260517_195452_azazel_credscrape.raw,dumps_v2/pairs/azazel_credscrape/memdump_20260517_195452_azazel_credscrape.raw,0,1,0,0,0,0,0,0,0,0,0,0,1,21,9,0,0,1,2,10,276,5,0,24,1

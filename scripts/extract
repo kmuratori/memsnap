@@ -1,12 +1,39 @@
 #!/usr/bin/env python3
+"""extract — Extract forensic features from memory dumps (parallel).
 
-"""extract — Extract forensic features from memory dumps (parallel)."""
+Primary use: batch training-data generation.
 
-import argparse, csv, json, re, subprocess, sys
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+    extract <dumps_dir> [features.csv]
+
+Processes an entire directory of dumps in parallel (ProcessPoolExecutor),
+derives labels from manifest.jsonl or directory structure, and writes a
+CSV for use by train.
+
+All Volatility logic is imported from memsnap_lib — no local duplicates.
+
+Optional DB side-effect (disabled via --no-db):
+    Each successfully processed dump is written to the SQLite DB so that
+    subsequent detect runs against the same dumps are instant cache hits.
+
+Usage:
+    extract dumps/ features.csv
+    extract dumps/ features.csv -w 4 -pw 3
+    extract dumps/ features.csv --no-db
+    extract dumps/ features.csv -a          # append to existing CSV
+"""
+
+import argparse
+import csv
+import json
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-SCRIPT_DIR  = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+LIB_DIR    = SCRIPT_DIR / ".." / "lib"
+sys.path.insert(0, str(LIB_DIR))
+
 ASSETS_DIR  = SCRIPT_DIR / ".." / "assets"
 SYMBOLS_DIR = ASSETS_DIR / "symbols"
 
@@ -16,194 +43,41 @@ ALL_ATTACKS = [
     "teamtnt", "multistage", "credscrape",
 ]
 
-PLUGINS = [
-    "linux.pslist.PsList",
-    "linux.psscan.PsScan",
-    "linux.malware.check_syscall.Check_syscall",
-    "linux.malware.hidden_modules.Hidden_modules",
-    "linux.sockstat.Sockstat",
-    "linux.malware.malfind.Malfind",
-    "linux.malware.netfilter.Netfilter",
-    "linux.proc.Maps",
-]
-
-SENTINEL   = -1
-BRACKET_RE = re.compile(r"^\[.+\]$")
-LOCAL_RE   = re.compile(r"^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1$|$)")
+from memsnap_lib import (
+    ALL_FEATURES,
+    PLUGINS,
+    compute_checksum,
+    run_all_plugins,
+    extract_features,
+)
+import db as _db
 
 
-# ── Volatility ────────────────────────────────────────────────────────────────
+# -- Label helpers ------------------------------------------------------------
 
-def run_plugin(dump_path, plugin):
-    print(f"  {plugin.split('.')[-1]}", file=sys.stderr, flush=True)
-    cmd = ["vol", "-f", str(dump_path), "-s", str(SYMBOLS_DIR),
-           "--renderer", "json", plugin]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return plugin, []
-        data = json.loads(proc.stdout)
-        if isinstance(data, list): return plugin, data
-        if isinstance(data, dict): return plugin, data.get("rows", data.get("data", []))
-        return plugin, []
-    except Exception as e:
-        print(f"    [!] {plugin} on {Path(dump_path).name}: {e}", file=sys.stderr)
-        return plugin, []
-
-
-def run_all_plugins(dump_path, plugin_workers=2):
-    results = {}
-    with ThreadPoolExecutor(max_workers=plugin_workers) as pool:
-        futures = {pool.submit(run_plugin, dump_path, p): p for p in PLUGINS}
-        for fut in as_completed(futures):
-            plugin, rows = fut.result()
-            results[plugin] = rows
-    return results
-
-
-# ── Feature extraction ────────────────────────────────────────────────────────
-
-def extract_features(results):
-    pslist    = results.get("linux.pslist.PsList",                         [])
-    psscan    = results.get("linux.psscan.PsScan",                         [])
-    chk       = results.get("linux.malware.check_syscall.Check_syscall",   [])
-    hidden    = results.get("linux.malware.hidden_modules.Hidden_modules",  [])
-    socks     = results.get("linux.sockstat.Sockstat",                     [])
-    malfind   = results.get("linux.malware.malfind.Malfind",               [])
-    netfilter = results.get("linux.malware.netfilter.Netfilter",           [])
-    maps      = results.get("linux.proc.Maps",                             [])
-
-    f = {}
-
-    # hidden processes
-    if pslist and psscan:
-        pids_list = {r.get("PID") for r in pslist if isinstance(r, dict)}
-        pids_scan = {r.get("PID") for r in psscan if isinstance(r, dict)}
-        f["hidden_proc_count"] = len(pids_scan - pids_list)
-    else:
-        f["hidden_proc_count"] = SENTINEL
-
-    # masqueraded kernel threads
-    if pslist:
-        f["masqueraded_proc_count"] = sum(
-            1 for p in pslist
-            if isinstance(p, dict)
-            and BRACKET_RE.match(str(p.get("COMM", p.get("Name", p.get("Process", "")))))
-            and p.get("PPID", p.get("ParentPID", 2)) not in (2, "2")
-        )
-    else:
-        f["masqueraded_proc_count"] = SENTINEL
-
-    # deleted executables
-    if pslist:
-        f["deleted_exe_count"] = sum(
-            1 for p in pslist
-            if isinstance(p, dict)
-            and "(deleted)" in str(p.get("File", p.get("Executable", "")))
-        )
-    else:
-        f["deleted_exe_count"] = SENTINEL
-
-    # hooked syscalls
-    if chk:
-        def is_hooked(r):
-            sym = str(r.get("Handler Symbol", ""))
-            return not any(sym.startswith(p) for p in (
-                "__x64_sys_", "__ia32_sys_", "sys_", "do_",
-                "__se_sys_", "__do_sys_", "ksys_"
-            ))
-        f["hooked_syscall_count"] = sum(
-            1 for r in chk if isinstance(r, dict) and is_hooked(r)
-        )
-    else:
-        f["hooked_syscall_count"] = SENTINEL
-
-    # hidden modules
-    f["hidden_module_count"] = len(hidden) if hidden else 0
-
-    # netfilter hooks
-    f["netfilter_hook_count"] = len(netfilter) if netfilter else 0
-
-    # RWX anonymous regions
-    if malfind:
-        f["rwx_region_count"] = sum(
-            1 for r in malfind
-            if isinstance(r, dict)
-            and "x" in str(r.get("Protection", r.get("Prot", ""))).lower()
-        )
-    else:
-        f["rwx_region_count"] = SENTINEL
-
-    # socket features
-    if socks:
-        f["total_sockets"] = len(socks)
-        raw = foreign = high_port = 0
-        for s in socks:
-            if not isinstance(s, dict): continue
-            family = str(s.get("Family",   "")).upper()
-            proto  = str(s.get("Protocol", s.get("Proto", ""))).upper()
-            state  = str(s.get("State",    "")).upper()
-            dst    = str(s.get("Foreign Address", s.get("Dst", s.get("Remote Address", ""))))
-            port   = s.get("Source Port", s.get("Local Port", s.get("Port", 0)))
-            if "PACKET" in family or "RAW" in proto:
-                raw += 1
-            if state == "ESTABLISHED" and not LOCAL_RE.match(dst):
-                foreign += 1
-            try:
-                if int(port) > 1024 and state in ("LISTEN", ""):
-                    high_port += 1
-            except (ValueError, TypeError):
-                pass
-        f["raw_socket_count"]   = raw
-        f["foreign_conn_count"] = foreign
-        f["high_port_count"]    = high_port
-    else:
-        f["total_sockets"] = f["raw_socket_count"] = \
-        f["foreign_conn_count"] = f["high_port_count"] = SENTINEL
-
-    # unknown shared libraries via proc maps (LD_PRELOAD indicator)
-    if maps:
-        known = ("/usr/lib", "/lib", "/usr/local/lib", "/usr/bin", "/usr/sbin")
-        seen  = set()
-        count = 0
-        for row in maps:
-            if not isinstance(row, dict): continue
-            path = str(row.get("File Path", row.get("Path", row.get("File", ""))))
-            if (".so" in path
-                    and not any(path.startswith(k) for k in known)
-                    and path not in seen
-                    and path != ""):
-                seen.add(path)
-                count += 1
-        f["unknown_lib_count"] = count
-    else:
-        f["unknown_lib_count"] = SENTINEL
-
-    return f
-
-
-# ── Label helpers ─────────────────────────────────────────────────────────────
-
-def labels_from_manifest(manifest_path):
-    mapping = {}
+def labels_from_manifest(manifest_path: Path) -> dict[str, list[str]]:
+    """Parse manifest.jsonl; returns {filename: [attack, ...]} mapping."""
+    mapping: dict[str, list[str]] = {}
     with open(manifest_path) as fh:
         for line in fh:
             line = line.strip()
-            if not line: continue
+            if not line:
+                continue
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
             fname  = Path(entry["path"]).name
             label  = entry.get("label", "clean")
-            active = set() if label == "clean" else {
+            active = [] if label == "clean" else [
                 a for a in label.split("_") if a in ALL_ATTACKS
-            }
+            ]
             mapping[fname] = active
     return mapping
 
 
-def labels_from_path(dump_path):
+def labels_from_path(dump_path: Path) -> set[str]:
+    """Derive active attack set from single/ or pairs/ directory structure."""
     parts = dump_path.parts
     if "single" in parts:
         idx    = parts.index("single")
@@ -216,45 +90,86 @@ def labels_from_path(dump_path):
     return set()
 
 
-# ── Per-dump worker ───────────────────────────────────────────────────────────
+# -- Per-dump worker ----------------------------------------------------------
 
-def process_dump(args):
-    dump_file, label_map, plugin_workers = args
-    dump_file = Path(dump_file)
+def process_dump(args: tuple) -> tuple[dict, str]:
+    """Worker: run plugins, extract features, return (row, log_block).
+
+    Runs inside a ProcessPoolExecutor worker — no DB access here.
+    All output is buffered into log_block and printed atomically by the
+    parent process to prevent interleaving across concurrent dumps.
+
+    Row contains private keys prefixed with '_' (elapsed, plugin_results)
+    used by the parent for DB writes; they are excluded from CSV output
+    via extrasaction='ignore'.
+    """
+    dump_file, label_map, plugin_workers, symbols_dir, timeout = args
+    dump_file   = Path(dump_file)
+    symbols_dir = Path(symbols_dir)
+
+    lines = [f"\n[dump] {dump_file.name}"]
 
     active = label_map.get(dump_file.name)
     if active is None:
         active = labels_from_path(dump_file)
     active = set(active)
 
-    print(f"\n[{dump_file.name}]", file=sys.stderr, flush=True)
-    results   = run_all_plugins(dump_file, plugin_workers)
-    feats     = extract_features(results)
+    t0 = time.monotonic()
+    plugin_results = run_all_plugins(
+        dump_file,
+        symbols_dir,
+        plugin_workers=plugin_workers,
+        verbose=False,
+        timeout=timeout,
+    )
+    elapsed = time.monotonic() - t0
+
+    for plugin, rows in plugin_results.items():
+        short = plugin.split(".")[-1]
+        lines.append(f"  [+] {short:<20s} {len(rows)} rows")
+
+    feats     = extract_features(plugin_results)
     label_row = {f"label_{a}": int(a in active) for a in ALL_ATTACKS}
 
-    row = {"dump_name": dump_file.name, "path": str(dump_file)}
+    row: dict = {"dump_name": dump_file.name, "path": str(dump_file)}
     row.update(label_row)
     row.update(feats)
-    return row
+
+    # Private metadata for the parent process (excluded from CSV)
+    row["_elapsed"]        = elapsed
+    row["_plugin_results"] = plugin_results
+
+    return row, "\n".join(lines)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Orchestrator -------------------------------------------------------------
 
-def process_directory(input_dir, output_csv, append=False, workers=3, plugin_workers=2):
+def process_directory(
+    input_dir: str,
+    output_csv: str,
+    append: bool       = False,
+    workers: int       = 3,
+    plugin_workers: int = 2,
+    timeout: int       = 300,
+    no_db: bool        = False,
+    db_path: Path      = _db.DEFAULT_DB_PATH,
+    symbols_dir: str | None = None,
+) -> None:
     input_path = Path(input_dir)
+    symbols    = Path(symbols_dir) if symbols_dir else SYMBOLS_DIR
+
     dumps = sorted(
         list(input_path.rglob("*.raw")) +
         list(input_path.rglob("*.lime")) +
         list(input_path.rglob("*.dmp"))
     )
     if not dumps:
-        print(f"[!] No dump files found under {input_dir}")
+        print(f"[-] No dump files found under {input_dir}")
         sys.exit(1)
 
     manifest_path = input_path / "manifest.jsonl"
     if manifest_path.exists():
         label_map = labels_from_manifest(manifest_path)
-        label_map = {k: list(v) for k, v in label_map.items()}
         print(f"[*] Loaded {len(label_map)} label entries from manifest.jsonl")
     else:
         label_map = {}
@@ -262,28 +177,32 @@ def process_directory(input_dir, output_csv, append=False, workers=3, plugin_wor
 
     peak_mb = workers * plugin_workers * 750
     total   = len(dumps)
-    print(f"[*] {total} dump(s) | dump-workers={workers} | plugin-workers={plugin_workers} "
-          f"| max vol procs={workers * plugin_workers} | est. peak RAM ~{peak_mb} MB\n")
+    print(
+        f"[*] {total} dump(s) | dump-workers={workers} | "
+        f"plugin-workers={plugin_workers} | timeout={timeout}s | "
+        f"max vol procs={workers * plugin_workers} | "
+        f"est. peak RAM ~{peak_mb} MB\n"
+    )
 
     label_cols = [f"label_{a}" for a in ALL_ATTACKS]
-    feat_cols  = [
-        "hidden_proc_count", "masqueraded_proc_count", "deleted_exe_count",
-        "hooked_syscall_count", "hidden_module_count", "netfilter_hook_count",
-        "rwx_region_count", "total_sockets", "raw_socket_count",
-        "foreign_conn_count", "high_port_count", "unknown_lib_count",
-    ]
-    fieldnames = ["dump_name", "path"] + label_cols + feat_cols
+    fieldnames = ["dump_name", "path"] + label_cols + ALL_FEATURES
 
-    exists    = Path(output_csv).exists()
-    mode      = "a" if append and exists else "w"
+    exists = Path(output_csv).exists()
+    mode   = "a" if append and exists else "w"
+
+    con       = None if no_db else _db.get_connection(db_path)
     completed = 0
     written   = 0
-    args_list = [(str(d), label_map, plugin_workers) for d in dumps]
+
+    args_list = [
+        (str(d), label_map, plugin_workers, str(symbols), timeout)
+        for d in dumps
+    ]
 
     with open(output_csv, mode, newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         if not (append and exists):
-            w.writeheader()
+            writer.writeheader()
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(process_dump, a): a[0] for a in args_list}
@@ -291,36 +210,98 @@ def process_directory(input_dir, output_csv, append=False, workers=3, plugin_wor
                 completed += 1
                 dump_name = Path(futures[fut]).name
                 try:
-                    row = fut.result()
-                    w.writerow(row)
+                    row, log = fut.result()
+
+                    # Print buffered plugin lines atomically
+                    print(log)
+
+                    # Optional DB side-effect (main process only)
+                    if con is not None:
+                        try:
+                            dump_path = Path(row["path"])
+                            sha256    = compute_checksum(dump_path)
+                            dump_id   = _db.upsert_dump(
+                                con, sha256,
+                                dump_path.stat().st_size,
+                                str(dump_path),
+                            )
+                            ext_id = _db.insert_extraction(
+                                con, dump_id,
+                                elapsed=row["_elapsed"],
+                                vol_version=None,
+                                success=True,
+                            )
+                            _db.insert_plugin_results(
+                                con, ext_id, row["_plugin_results"]
+                            )
+                            _db.insert_features(con, ext_id, row)
+                        except Exception as db_err:
+                            print(
+                                f"  [!] DB write failed for {dump_name}: {db_err}",
+                                file=sys.stderr,
+                            )
+
+                    writer.writerow(row)
                     fh.flush()
                     written += 1
-                    print(f"  [{completed}/{total}] {dump_name}  OK")
+                    print(f"  [{completed}/{total}] {dump_name} -> OK")
+
                 except Exception as e:
-                    print(f"  [{completed}/{total}] {dump_name}  ERROR: {e}",
-                          file=sys.stderr)
+                    print(
+                        f"  [{completed}/{total}] {dump_name} -> ERROR: {e}",
+                        file=sys.stderr,
+                    )
+
+    if con is not None:
+        con.close()
 
     print(f"\n[+] {written}/{total} rows written to {output_csv}")
 
+
+# -- Entry point --------------------------------------------------------------
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Memory guide (750 MB per vol process assumed):\n"
-            "  7 GB RAM  →  -w 3 -pw 2  (peak ~4.5 GB, ~13 h for 204 dumps)\n"
-            "  16 GB RAM →  -w 4 -pw 3  (peak ~9.0 GB, ~ 6 h for 204 dumps)\n"
+            "  7 GB RAM  ->  -w 3 -pw 2  (peak ~4.5 GB, ~13 h for 204 dumps)\n"
+            "  16 GB RAM ->  -w 4 -pw 3  (peak ~9.0 GB, ~6 h for 204 dumps)\n"
         ),
     )
-    p.add_argument("input_dir")
-    p.add_argument("output_csv", nargs="?", default="features.csv")
-    p.add_argument("-a",  "--append",         action="store_true")
-    p.add_argument("-w",  "--workers",        type=int, default=3,
+    p.add_argument("input_dir",
+                   help="Directory containing .raw / .lime / .dmp files")
+    p.add_argument("output_csv", nargs="?", default="features.csv",
+                   help="Output CSV path (default: features.csv)")
+    p.add_argument("-a", "--append", action="store_true",
+                   help="Append to existing CSV instead of overwriting")
+    p.add_argument("-w", "--workers", type=int, default=3,
                    help="Parallel dump workers (default: 3)")
     p.add_argument("-pw", "--plugin-workers", type=int, default=2,
                    dest="plugin_workers",
                    help="Parallel plugin threads per dump (default: 2); "
-                        "total vol procs = workers × plugin-workers")
+                        "total vol procs = workers x plugin-workers")
+    p.add_argument("-t", "--timeout", type=int, default=300,
+                   help="Per-plugin timeout in seconds (default: 300)")
+    p.add_argument("-s", "--symbols", default=None,
+                   dest="symbols",
+                   help="Volatility symbols directory "
+                        "(default: assets/symbols)")
+    p.add_argument("--no-db", action="store_true",
+                   help="Skip DB writes (useful for quick re-extractions "
+                        "during dataset building)")
+    p.add_argument("--db", type=Path, default=_db.DEFAULT_DB_PATH,
+                   help=f"SQLite database path (default: {_db.DEFAULT_DB_PATH})")
     args = p.parse_args()
-    process_directory(args.input_dir, args.output_csv,
-                      args.append, args.workers, args.plugin_workers)
+
+    process_directory(
+        args.input_dir,
+        args.output_csv,
+        append=args.append,
+        workers=args.workers,
+        plugin_workers=args.plugin_workers,
+        timeout=args.timeout,
+        no_db=args.no_db,
+        db_path=args.db,
+        symbols_dir=args.symbols,
+    )

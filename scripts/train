@@ -1,158 +1,57 @@
 #!/usr/bin/env python3
+"""train -- unified MemSnap classifier trainer.
 
-"""Train a multi-output Random Forest classifier on features.csv."""
+Modes
+-----
+  Default (multi-label RF)
+      Trains a MultiOutputClassifier(RandomForestClassifier) to predict all 13
+      malware-family labels simultaneously.  Evaluation uses Leave-One-Out CV.
 
-import argparse, sys
+  Binary  (-b / --binary)
+      Trains a single RandomForestClassifier to answer "infected or clean?".
+      Evaluation uses stratified 5-fold CV with per-fold and aggregate metrics.
+
+Usage
+-----
+    train -i features.csv                              # multi-label (stage 2)
+    train -i features.csv -b                           # binary      (stage 1)
+    train -i features.csv -b -o binary_clf.joblib
+    train -i features_nocleanlines.csv -o family_clf.joblib
+    train -i features.csv -b --no-eval -o binary_clf.joblib
+"""
+
+import argparse
+import sys
+import time
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.multioutput import MultiOutputClassifier
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import f1_score
 import joblib
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.model_selection import LeaveOneOut, StratifiedKFold, cross_validate
+from sklearn.multioutput import MultiOutputClassifier
 
-# ── Column definitions ────────────────────────────────────────────────────────
+SCRIPT_DIR = Path(__file__).resolve().parent
+LIB_DIR    = SCRIPT_DIR / ".." / "lib"
+sys.path.insert(0, str(LIB_DIR))
 
-# Zero-variance features confirmed from data audit — drop entirely
-DEAD_FEATURES = [
-    "deleted_exe_count",       # always 0
-    "hooked_syscall_count",    # always 0  (Check_syscall bug)
-    "foreign_conn_count",      # always 0
-    "high_port_count",         # always 24
-    "netfilter_hook_count",    # always 2
-]
+from memsnap_lib import (
+    ALL_FEATURES,
+    BINARY_FEATURES,
+    DEAD_FEATURES,
+    LABELS,
+    load_csv_and_clean,
+    sample_weights,
+)
 
-FEATURES = [
-    "hidden_proc_count",
-    "masqueraded_proc_count",
-    "hidden_module_count",
-    "rwx_region_count",
-    "total_sockets",
-    "raw_socket_count",
-    "unknown_lib_count",
-]
-
-LABELS = [
-    "label_rootkit", "label_azazel",      "label_orbit",    "label_mirai",
-    "label_syslogk", "label_reptile",     "label_bpfbackdoor",
-    "label_reverseshell", "label_skidmap", "label_cryptominer",
-    "label_teamtnt", "label_multistage",  "label_credscrape",
-]
-
-SENTINEL = -1
+OVERFIT_GAP_WARN = 0.15   # flag LOO rows where train-test gap exceeds this
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# -- RF constructors ----------------------------------------------------------
 
-def load_and_clean(csv_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df = pd.read_csv(csv_path)
-
-    missing = [c for c in FEATURES + LABELS if c not in df.columns]
-    if missing:
-        print(f"[!] Missing expected columns: {missing}", file=sys.stderr)
-        sys.exit(1)
-
-    X = df[FEATURES].copy()
-    y = df[LABELS].copy()
-
-    # Impute sentinels with column median (only rwx_region_count and
-    # unknown_lib_count have any; 5 rows total)
-    sentinel_counts = (X == SENTINEL).sum()
-    sentinel_cols   = sentinel_counts[sentinel_counts > 0]
-    if not sentinel_cols.empty:
-        print("[*] Imputing sentinel (-1) values:")
-        for col in sentinel_cols.index:
-            median = X.loc[X[col] != SENTINEL, col].median()
-            n      = sentinel_counts[col]
-            X.loc[X[col] == SENTINEL, col] = median
-            print(f"    {col}: {n} row(s) → median {median:.0f}")
-
-    return X, y
-
-
-def sample_weight_from_labels(y: pd.DataFrame) -> np.ndarray:
-    """Down-weight clean samples so the 9-vs-195 imbalance doesn't dominate."""
-    is_clean = (y == 0).all(axis=1)
-    n_infected = (~is_clean).sum()
-    n_clean    = is_clean.sum()
-    ratio      = n_infected / n_clean if n_clean else 1.0
-    weights    = np.where(is_clean, ratio, 1.0)
-    print(f"[*] Class weights: infected=1.0  clean={ratio:.1f}  "
-          f"(n_infected={n_infected}, n_clean={n_clean})")
-    return weights
-
-
-# ── Evaluation ───────────────────────────────────────────────────────────────
-
-def evaluate(X: pd.DataFrame, y: pd.DataFrame, weights: np.ndarray):
-    """Stratified 5-fold CV. Stratify on a combined any-attack binary label."""
-    strat_label = (y == 1).any(axis=1).astype(int)
-
-    print("\n[*] Stratified 5-fold CV — per-label F1:")
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    f1s = {}
-    for label in LABELS:
-        fold_scores = []
-        for train_idx, test_idx in skf.split(X, strat_label):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y[label].iloc[train_idx], y[label].iloc[test_idx]
-            w_train = weights[train_idx]
-
-            inner_clf = RandomForestClassifier(
-                n_estimators=200, max_depth=6, min_samples_leaf=3,
-                class_weight="balanced", random_state=42, n_jobs=-1
-            )
-            inner_clf.fit(X_train, y_train, sample_weight=w_train)
-            y_pred = inner_clf.predict(X_test)
-            fold_scores.append(f1_score(y_test, y_pred, zero_division=0))
-
-        mean_f1 = np.mean(fold_scores)
-        f1s[label] = mean_f1
-        bar = "█" * int(mean_f1 * 20)
-        print(f"  {label.replace('label_', ''):20s} {mean_f1:.3f}  {bar}")
-
-    mean_all = np.mean(list(f1s.values()))
-    print(f"\n  {'macro mean':20s} {mean_all:.3f}")
-    return f1s
-
-
-# ── Feature importance ───────────────────────────────────────────────────────
-
-def print_importances(clf, feature_names):
-    imps = np.mean(
-        [est.feature_importances_ for est in clf.estimators_], axis=0
-    )
-    print("\n[*] Mean feature importances (across all labels):")
-    for feat, imp in sorted(zip(feature_names, imps), key=lambda x: -x[1]):
-        bar = "█" * int(imp * 40)
-        print(f"  {feat:30s} {imp:.3f}  {bar}")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Train the detection model")
-    p.add_argument("-i", "--input",  required=True, help="Path to features CSV")
-    p.add_argument("-o", "--output", default="model.pkl",
-                   help="Where to save the trained model (default: model.pkl)")
-    p.add_argument("--no-eval", action="store_true",
-                   help="Skip CV evaluation (faster, just fit and save)")
-    args = p.parse_args()
-
-    if not Path(args.input).exists():
-        print(f"[!] File not found: {args.input}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"[*] Loading {args.input}")
-    X, y = load_and_clean(args.input)
-    print(f"[*] {len(X)} samples  |  {len(FEATURES)} features  |  {len(LABELS)} labels")
-    print(f"[*] Dropped zero-variance features: {', '.join(DEAD_FEATURES)}")
-
-    weights = sample_weight_from_labels(y)
-
-    base_clf = RandomForestClassifier(
+def _make_binary_rf() -> RandomForestClassifier:
+    return RandomForestClassifier(
         n_estimators=200,
         max_depth=6,
         min_samples_leaf=3,
@@ -161,25 +60,202 @@ if __name__ == "__main__":
         n_jobs=-1,
     )
 
+
+def _make_multilabel_rf() -> MultiOutputClassifier:
+    return MultiOutputClassifier(
+        RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    )
+
+
+# -- Multi-label evaluation (LOO) ---------------------------------------------
+
+def eval_multilabel(X, y) -> None:
+    loo = LeaveOneOut()
+    n   = len(X)
+    print(f"\n[*] LOO cross-validation ({n} folds):")
+
+    label_train, label_test = [], []
+
+    for i, label in enumerate(LABELS, 1):
+        clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        cv  = cross_validate(
+            clf, X, y[label],
+            cv=loo,
+            scoring="accuracy",
+            return_train_score=True,
+            n_jobs=-1,
+        )
+        train_acc = cv["train_score"].mean()
+        test_acc  = cv["test_score"].mean()
+        gap       = train_acc - test_acc
+        name      = label.replace("label_", "")
+
+        overfit = f"  (gap: {gap:.3f}) [!] overfit?" if gap > OVERFIT_GAP_WARN else ""
+        print(f"[{i}/{len(LABELS)}]  {name:20s}  train={train_acc:.3f}  test={test_acc:.3f}{overfit}")
+
+        label_train.append(train_acc)
+        label_test.append(test_acc)
+
+    # Exact-match row
+    clf_multi = _make_multilabel_rf()
+    cv_multi  = cross_validate(
+        clf_multi, X, y,
+        cv=loo,
+        scoring="accuracy",
+        return_train_score=True,
+    )
+    exact_train = cv_multi["train_score"].mean()
+    exact_test  = cv_multi["test_score"].mean()
+
+    print("-" * 56)
+    print(f"{'':9s} exact match  {'':9s}  train={exact_train:.3f}  test={exact_test:.3f}")
+
+
+# -- Binary evaluation (stratified 5-fold) ------------------------------------
+
+def eval_binary(X, y, weights: np.ndarray) -> None:
+    n_splits = 5
+    print(f"\n[*] Stratified {n_splits}-fold CV -- binary classifier:")
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    all_true, all_preds, fold_f1s = [], [], []
+
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), 1):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        w_train         = weights[train_idx]
+
+        clf = _make_binary_rf()
+        clf.fit(X_train, y_train, sample_weight=w_train)
+        y_pred = clf.predict(X_test)
+
+        train_acc = accuracy_score(y_train, clf.predict(X_train))
+        test_acc  = accuracy_score(y_test,  y_pred)
+        fold_f1   = f1_score(y_test, y_pred, zero_division=0)
+
+        all_true.extend(y_test.values)
+        all_preds.extend(y_pred)
+        fold_f1s.append(fold_f1)
+
+        print(
+            f"  [{fold}/{n_splits}]  "
+            f"train={train_acc:.3f}  test={test_acc:.3f}  F1={fold_f1:.3f}"
+        )
+
+    print("-" * 56)
+    print(f"  {'Accuracy':<12s}  {accuracy_score(all_true, all_preds):.4f}")
+    print(f"  {'F1':<12s}  {f1_score(all_true, all_preds, zero_division=0):.4f}")
+    print(f"  {'Precision':<12s}  {precision_score(all_true, all_preds, zero_division=0):.4f}")
+    print(f"  {'Recall':<12s}  {recall_score(all_true, all_preds, zero_division=0):.4f}")
+    print(f"  Mean fold F1: {np.mean(fold_f1s):.3f} (+/- {np.std(fold_f1s):.3f})")
+
+
+# -- Feature importance printers ----------------------------------------------
+
+def _print_importances_binary(clf: RandomForestClassifier, features: list[str]) -> None:
+    print("\n[*] Feature importances:")
+    for feat, imp in sorted(
+        zip(features, clf.feature_importances_), key=lambda x: -x[1]
+    ):
+        bar = "#" * int(imp * 40)
+        print(f"  {feat:<30s}  {imp:.3f}  {bar}")
+
+
+def _print_importances_multilabel(clf: MultiOutputClassifier, features: list[str]) -> None:
+    mean_imp = np.mean(
+        [est.feature_importances_ for est in clf.estimators_], axis=0
+    )
+    print("\n[*] Feature importances (mean across all labels):")
+    for feat, imp in sorted(zip(features, mean_imp), key=lambda x: -x[1]):
+        bar = "#" * int(imp * 40)
+        print(f"  {feat:<30s}  {imp:.3f}  {bar}")
+
+
+# -- Main ---------------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Train the MemSnap detection model (multi-label or binary).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("-i", "--input",  required=True,
+                   help="Path to features CSV")
+    p.add_argument("-o", "--output", default=None,
+                   help="Output .joblib path  "
+                        "(default: binary_clf.joblib or family_clf.joblib)")
+    p.add_argument("-b", "--binary", action="store_true",
+                   help="Train binary infected/clean classifier (stage 1)")
+    p.add_argument("--no-eval", action="store_true",
+                   help="Skip cross-validation (faster -- just fit and save)")
+    args = p.parse_args()
+
+    if not Path(args.input).exists():
+        print(f"[-] File not found: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    # -- Resolve output path --------------------------------------------------
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        out_path = Path("binary_clf.joblib") if args.binary else Path("family_clf.joblib")
+
+    # -- Load data ------------------------------------------------------------
+    mode_label = "binary (infected/clean)" if args.binary else "multi-label (family)"
+    print(f"[*] Loading {args.input}  [{mode_label} mode]")
+    X, y = load_csv_and_clean(args.input, binary=args.binary)
+
+    features = BINARY_FEATURES if args.binary else ALL_FEATURES
+    print(f"[*] {len(X)} samples | {len(features)} features", end="")
+    if args.binary:
+        print("  |  binary label (infected/clean)")
+        print(f"[*] Dropped zero-variance features: {', '.join(DEAD_FEATURES)}")
+    else:
+        print(f"  |  {len(LABELS)} labels")
+
+    # -- Evaluate -------------------------------------------------------------
+    weights = None
     if not args.no_eval:
-        evaluate(X, y, weights)
+        if args.binary:
+            weights = sample_weights(y)
+            eval_binary(X, y, weights)
+        else:
+            eval_multilabel(X, y)
 
-    # Final fit on full dataset
+    # -- Train final model on full dataset ------------------------------------
     print("\n[*] Fitting final model on full dataset...")
-    clf = MultiOutputClassifier(base_clf)
-    # Initialize estimators_ first (required by some sklearn versions)
-    clf.fit(X, y)
-    # Re-fit each estimator with per-sample weights
-    for est, label in zip(clf.estimators_, LABELS):
-        est.fit(X, y[label], sample_weight=weights)
+    t0 = time.monotonic()
 
-    print_importances(clf, FEATURES)
+    if args.binary:
+        if weights is None:
+            weights = sample_weights(y)
+        clf = _make_binary_rf()
+        clf.fit(X, y, sample_weight=weights)
+        elapsed = time.monotonic() - t0
+        print(f"[+] Done ({elapsed:.1f}s)")
+        _print_importances_binary(clf, features)
+        meta = {
+            "model":    clf,
+            "features": features,
+            "labels":   ["infected"],
+            "type":     "binary",
+        }
+    else:
+        clf = _make_multilabel_rf()
+        clf.fit(X, y)
+        elapsed = time.monotonic() - t0
+        print(f"[+] Done ({elapsed:.1f}s)")
+        _print_importances_multilabel(clf, features)
+        meta = {
+            "model":    clf,
+            "features": features,
+            "labels":   LABELS,
+            "type":     "family",
+        }
 
-    out = Path(args.output)
-    meta = {
-        "model":    clf,
-        "features": FEATURES,
-        "labels":   LABELS,
-    }
-    joblib.dump(meta, out)
-    print(f"\n[+] Saved to {out}  (keys: model, features, labels)")
+    joblib.dump(meta, out_path)
+    print(f"\n[+] Saved to {out_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,337 +1,244 @@
 #!/usr/bin/env python3
+"""detect — Two-stage malware detection from a Linux memory dump.
 
-"""Detect malware families from a single Linux memory dump."""
+Stage 1 (binary_clf.joblib)  -- is this machine infected at all?
+Stage 2 (family_clf.joblib)  -- which malware families are present?
+                            (only runs if stage 1 says infected)
 
-import argparse, json, re, subprocess, sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+Plugin results are cached in SQLite via db.py so that re-running detection
+against the same dump skips the expensive Volatility execution entirely.
+
+Usage:
+    detect <dump>
+    detect <dump> -b binary_clf.joblib -m family_clf.joblib
+    detect <dump> --no-cache
+    detect <dump> --json
+"""
+
+import argparse
+import json as _json
+import sys
+import time
 from pathlib import Path
 
-import joblib
 import pandas as pd
-import numpy as np
 
-SCRIPT_DIR  = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+LIB_DIR    = SCRIPT_DIR / ".." / "lib"
+sys.path.insert(0, str(LIB_DIR))
+
 ASSETS_DIR  = SCRIPT_DIR / ".." / "assets"
 SYMBOLS_DIR = ASSETS_DIR / "symbols"
-DEFAULT_MODEL = ASSETS_DIR / "ai-model" / "model.pkl"
+DEFAULT_BINARY_MODEL = ASSETS_DIR / "ai-model" / "binary_clf.joblib"
+DEFAULT_FAMILY_MODEL = ASSETS_DIR / "ai-model" / "family_clf.joblib"
 
-PLUGINS = [
-    "linux.pslist.PsList",
-    "linux.psscan.PsScan",
-    "linux.malware.check_syscall.Check_syscall",
-    "linux.malware.hidden_modules.Hidden_modules",
-    "linux.sockstat.Sockstat",
-    "linux.malware.malfind.Malfind",
-    "linux.malware.netfilter.Netfilter",
-    "linux.proc.Maps",
-]
-
-SENTINEL   = -1
-BRACKET_RE = re.compile(r"^\[.+\]$")
-LOCAL_RE   = re.compile(r"^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1$|$)")
-
-# Medians computed from the training set — must match train-time imputation
-TRAINING_MEDIANS = {
-    "rwx_region_count": 8,
-    "unknown_lib_count": 0,
-}
+import db as _db
+from memsnap_lib import (
+    PLUGINS,
+    SENTINEL,
+    align_features,
+    compute_checksum,
+    extract_features,
+    impute_sentinels,
+    load_model,
+    print_family_table,
+    print_feature_vector,
+    run_all_plugins,
+    stage1_binary,
+    stage2_families,
+)
 
 
-# ── Volatility (identical to extract) ─────────────────────────────────────────
+# -- Main ---------------------------------------------------------------------
 
-def run_plugin(dump_path, plugin):
-    print(f"  {plugin.split('.')[-1]}", file=sys.stderr, flush=True)
-    cmd = ["vol", "-f", str(dump_path), "-s", str(SYMBOLS_DIR),
-           "--renderer", "json", plugin]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return plugin, []
-        data = json.loads(proc.stdout)
-        if isinstance(data, list): return plugin, data
-        if isinstance(data, dict): return plugin, data.get("rows", data.get("data", []))
-        return plugin, []
-    except Exception as e:
-        print(f"    [!] {plugin} on {Path(dump_path).name}: {e}", file=sys.stderr)
-        return plugin, []
-
-
-def run_all_plugins(dump_path, plugin_workers=2):
-    results = {}
-    with ThreadPoolExecutor(max_workers=plugin_workers) as pool:
-        futures = {pool.submit(run_plugin, dump_path, p): p for p in PLUGINS}
-        for fut in as_completed(futures):
-            plugin, rows = fut.result()
-            results[plugin] = rows
-    return results
-
-
-# ── Feature extraction (identical to extract) ─────────────────────────────────
-
-def extract_features(results):
-    pslist    = results.get("linux.pslist.PsList",                         [])
-    psscan    = results.get("linux.psscan.PsScan",                         [])
-    chk       = results.get("linux.malware.check_syscall.Check_syscall",   [])
-    hidden    = results.get("linux.malware.hidden_modules.Hidden_modules",  [])
-    socks     = results.get("linux.sockstat.Sockstat",                     [])
-    malfind   = results.get("linux.malware.malfind.Malfind",               [])
-    netfilter = results.get("linux.malware.netfilter.Netfilter",           [])
-    maps      = results.get("linux.proc.Maps",                             [])
-
-    f = {}
-
-    # hidden processes
-    if pslist and psscan:
-        pids_list = {r.get("PID") for r in pslist if isinstance(r, dict)}
-        pids_scan = {r.get("PID") for r in psscan if isinstance(r, dict)}
-        f["hidden_proc_count"] = len(pids_scan - pids_list)
-    else:
-        f["hidden_proc_count"] = SENTINEL
-
-    # masqueraded kernel threads
-    if pslist:
-        f["masqueraded_proc_count"] = sum(
-            1 for p in pslist
-            if isinstance(p, dict)
-            and BRACKET_RE.match(str(p.get("COMM", p.get("Name", p.get("Process", "")))))
-            and p.get("PPID", p.get("ParentPID", 2)) not in (2, "2")
-        )
-    else:
-        f["masqueraded_proc_count"] = SENTINEL
-
-    # deleted executables
-    if pslist:
-        f["deleted_exe_count"] = sum(
-            1 for p in pslist
-            if isinstance(p, dict)
-            and "(deleted)" in str(p.get("File", p.get("Executable", "")))
-        )
-    else:
-        f["deleted_exe_count"] = SENTINEL
-
-    # hooked syscalls
-    if chk:
-        def is_hooked(r):
-            sym = str(r.get("Handler Symbol", ""))
-            return not any(sym.startswith(p) for p in (
-                "__x64_sys_", "__ia32_sys_", "sys_", "do_",
-                "__se_sys_", "__do_sys_", "ksys_"
-            ))
-        f["hooked_syscall_count"] = sum(
-            1 for r in chk if isinstance(r, dict) and is_hooked(r)
-        )
-    else:
-        f["hooked_syscall_count"] = SENTINEL
-
-    # hidden modules
-    f["hidden_module_count"] = len(hidden) if hidden else 0
-
-    # netfilter hooks
-    f["netfilter_hook_count"] = len(netfilter) if netfilter else 0
-
-    # RWX anonymous regions
-    if malfind:
-        f["rwx_region_count"] = sum(
-            1 for r in malfind
-            if isinstance(r, dict)
-            and "x" in str(r.get("Protection", r.get("Prot", ""))).lower()
-        )
-    else:
-        f["rwx_region_count"] = SENTINEL
-
-    # socket features
-    if socks:
-        f["total_sockets"] = len(socks)
-        raw = foreign = high_port = 0
-        for s in socks:
-            if not isinstance(s, dict): continue
-            family = str(s.get("Family",   "")).upper()
-            proto  = str(s.get("Protocol", s.get("Proto", ""))).upper()
-            state  = str(s.get("State",    "")).upper()
-            dst    = str(s.get("Foreign Address", s.get("Dst", s.get("Remote Address", ""))))
-            port   = s.get("Source Port", s.get("Local Port", s.get("Port", 0)))
-            if "PACKET" in family or "RAW" in proto:
-                raw += 1
-            if state == "ESTABLISHED" and not LOCAL_RE.match(dst):
-                foreign += 1
-            try:
-                if int(port) > 1024 and state in ("LISTEN", ""):
-                    high_port += 1
-            except (ValueError, TypeError):
-                pass
-        f["raw_socket_count"]   = raw
-        f["foreign_conn_count"] = foreign
-        f["high_port_count"]    = high_port
-    else:
-        f["total_sockets"] = f["raw_socket_count"] = \
-        f["foreign_conn_count"] = f["high_port_count"] = SENTINEL
-
-    # unknown shared libraries via proc maps (LD_PRELOAD indicator)
-    if maps:
-        known = ("/usr/lib", "/lib", "/usr/local/lib", "/usr/bin", "/usr/sbin")
-        seen  = set()
-        count = 0
-        for row in maps:
-            if not isinstance(row, dict): continue
-            path = str(row.get("File Path", row.get("Path", row.get("File", ""))))
-            if (".so" in path
-                    and not any(path.startswith(k) for k in known)
-                    and path not in seen
-                    and path != ""):
-                seen.add(path)
-                count += 1
-        f["unknown_lib_count"] = count
-    else:
-        f["unknown_lib_count"] = SENTINEL
-
-    return f
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def impute_sentinels(X: pd.DataFrame) -> pd.DataFrame:
-    """Replace sentinel (-1) values with training medians; any leftover -> 0."""
-    X = X.copy()
-    for col, median in TRAINING_MEDIANS.items():
-        if col in X.columns:
-            X.loc[X[col] == SENTINEL, col] = median
-    X = X.replace(SENTINEL, 0)
-    return X
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(
-        description="Detect malware families from a Linux memory dump"
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Two-stage malware detection from a Linux memory dump"
     )
-    p.add_argument("dump", help="Path to memory dump")
-    p.add_argument("-m", "--model", default=str(DEFAULT_MODEL),
-                   help="Path to model.pkl (default: assets/ai-model/model.pkl)")
-    p.add_argument("-t", "--threshold", type=float, default=0.5,
-                   help="Probability threshold for detection (default: 0.5)")
-    p.add_argument("--json", action="store_true",
-                   help="Emit machine-readable JSON instead of table")
-    p.add_argument("-pw", "--plugin-workers", type=int, default=2,
-                   dest="plugin_workers",
-                   help="Parallel plugin threads (default: 2)")
-    args = p.parse_args()
+    ap.add_argument("dump",
+                    help="Path to memory dump")
+    ap.add_argument("-b", "--binary-model", default=str(DEFAULT_BINARY_MODEL),
+                    dest="binary_model",
+                    help="Path to binary_clf.joblib  (default: assets/ai-model/binary_clf.joblib)")
+    ap.add_argument("-m", "--model", default=str(DEFAULT_FAMILY_MODEL),
+                    help="Path to family_clf.joblib  (default: assets/ai-model/family_clf.joblib)")
+    ap.add_argument("-t", "--threshold", type=float, default=0.5,
+                    help="Probability threshold for both stages (default: 0.5)")
+    ap.add_argument("-s", "--symbols", default=str(SYMBOLS_DIR),
+                    help="Volatility symbols directory (default: assets/symbols)")
+    ap.add_argument("-pw", "--plugin-workers", type=int, default=2,
+                    dest="plugin_workers",
+                    help="Parallel Volatility threads (default: 2)")
+    ap.add_argument("--timeout", type=int, default=900,
+                    help="Per-plugin timeout in seconds (default: 900)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="Ignore DB cache -- always re-run Volatility")
+    ap.add_argument("--json", action="store_true",
+                    help="Emit machine-readable JSON instead of human output")
+    ap.add_argument("--db", type=Path, default=_db.DEFAULT_DB_PATH,
+                    help=f"SQLite database path (default: {_db.DEFAULT_DB_PATH})")
+    args = ap.parse_args()
 
     dump_path = Path(args.dump)
     if not dump_path.exists():
-        print(f"[!] File not found: {args.dump}")
+        print(f"[-] File not found: {args.dump}")
         sys.exit(1)
 
-    # ── Load model ──────────────────────────────────────────────────────────
-    try:
-        meta = joblib.load(args.model)
-    except FileNotFoundError:
-        print(f"[!] Model not found at {args.model}. Run train first.")
-        sys.exit(1)
+    # -- Open DB --------------------------------------------------------------
+    con = _db.get_connection(args.db)
 
-    if isinstance(meta, dict):
-        model = meta["model"]
-        feature_names = meta.get("features")
-        label_names = meta.get("labels")
-    else:
-        model = meta
-        feature_names = None
-        label_names = None
+    # -- Load models ----------------------------------------------------------
+    binary_model, binary_features, _, _           = load_model(args.binary_model, "Binary")
+    family_model, family_features, label_names, _ = load_model(args.model,        "Family")
 
-    # ── Extract features ────────────────────────────────────────────────────
+    # -- Checksum + dump record -----------------------------------------------
     if not args.json:
-        print("[*] Running Volatility plugins...", file=sys.stderr)
+        print("[*] Computing checksum...", file=sys.stderr)
 
-    results = run_all_plugins(args.dump, plugin_workers=args.plugin_workers)
-    feats = extract_features(results)
-    X_new = pd.DataFrame([feats])
+    sha256  = compute_checksum(dump_path)
+    dump_id = _db.upsert_dump(
+        con, sha256, dump_path.stat().st_size, str(dump_path)
+    )
 
-    # Align to the exact columns the model was trained on
-    if feature_names:
-        for col in feature_names:
-            if col not in X_new.columns:
-                X_new[col] = 0
-        X_new = X_new[feature_names]
-    else:
-        # Fallback — the 7 live features from training
-        expected = [
-            "hidden_proc_count", "masqueraded_proc_count", "hidden_module_count",
-            "rwx_region_count", "total_sockets", "raw_socket_count", "unknown_lib_count",
-        ]
-        for col in expected:
-            if col not in X_new.columns:
-                X_new[col] = 0
-        X_new = X_new[expected]
+    # -- Cache lookup ---------------------------------------------------------
+    extraction_id = None
+    cache_hit     = False
+    feats         = None
 
-    X_new = impute_sentinels(X_new)
+    if not args.no_cache:
+        extraction_id = _db.get_cached_extraction(con, dump_id)
+        if extraction_id is not None:
+            feats = _db.load_features(con, extraction_id)
+            if feats:
+                cache_hit = True
 
     if not args.json:
-        print("\n[*] Feature vector:")
-        for col in X_new.columns:
-            val = X_new[col].iloc[0]
-            print(f"    {col:30s}: {val}")
+        hit_str = "HIT" if cache_hit else "MISS"
+        print(f"[+] sha256: {sha256[:16]}...  (cache {hit_str})", file=sys.stderr)
 
-    # ── Inference ───────────────────────────────────────────────────────────
-    pred = model.predict(X_new)[0]
+    # -- Run Volatility if needed ---------------------------------------------
+    if not cache_hit:
+        if not args.json:
+            print(
+                f"[*] Running Volatility plugins ({len(PLUGINS)})...",
+                file=sys.stderr,
+            )
 
-    try:
-        probas = model.predict_proba(X_new)
-        has_proba = True
-    except Exception:
-        probas = None
-        has_proba = False
+        t0 = time.monotonic()
+        plugin_results = run_all_plugins(
+            dump_path,
+            args.symbols,
+            plugin_workers=args.plugin_workers,
+            verbose=not args.json,
+            timeout=args.timeout,
+        )
+        elapsed = time.monotonic() - t0
 
-    if label_names:
-        labels = [l.replace("label_", "") for l in label_names]
-    else:
-        labels = [
-            "rootkit", "azazel", "orbit", "mirai", "syslogk", "reptile",
-            "bpfbackdoor", "reverseshell", "skidmap", "cryptominer",
-            "teamtnt", "multistage", "credscrape",
-        ]
+        feats = extract_features(plugin_results)
 
-    results_out = []
-    for i, label in enumerate(labels):
-        detected = bool(pred[i])
-        conf = None
-        if has_proba and i < len(probas):
-            arr = probas[i][0]
-            conf = float(arr[1]) if len(arr) > 1 else float(arr[0])
-        is_detected = detected or (conf is not None and conf >= args.threshold)
-        results_out.append({
-            "family": label,
-            "detected": is_detected,
-            "confidence": round(conf, 4) if conf is not None else None,
-        })
+        extraction_id = _db.insert_extraction(
+            con, dump_id,
+            elapsed=elapsed,
+            vol_version=None,
+            success=True,
+        )
+        _db.insert_plugin_results(con, extraction_id, plugin_results)
+        _db.insert_features(con, extraction_id, feats)
 
-    # ── Output ────────────────────────────────────────────────────────────────
+    # -- Build feature matrix -------------------------------------------------
+    X_raw = pd.DataFrame([feats])
+
+    n_sentinel = sum(1 for v in feats.values() if v == SENTINEL)
+    n_total    = len(feats)
+
+    if not args.json:
+        print_feature_vector(
+            impute_sentinels(
+                align_features(
+                    X_raw.copy(),
+                    binary_features or list(X_raw.columns),
+                )
+            )
+        )
+
+    if n_sentinel > n_total // 2:
+        msg = (
+            f"[!] WARNING: {n_sentinel}/{n_total} features are sentinel (-1) --\n"
+            f"    most Volatility plugins returned no data.\n"
+            f"    Results below are based on imputed defaults and are NOT reliable.\n"
+            f"    Check that 'vol' is on PATH, symbol path is correct, "
+            f"and the dump is valid."
+        )
+        print(msg, file=sys.stderr)
+        if not args.json:
+            print(msg)
+
+    # -- Stage 1 — binary triage ----------------------------------------------
+    t_scan = time.monotonic()
+
+    is_infected, binary_conf = stage1_binary(
+        binary_model, binary_features, X_raw, args.threshold
+    )
+
     if args.json:
-        import json as _json
-        print(_json.dumps(results_out, indent=2))
-        sys.exit(0)
-
-    print("\n" + "=" * 56)
-    print(f"{'MALWARE FAMILY':20s} {'STATUS':12s} {'CONFIDENCE':>12s}")
-    print("=" * 56)
-
-    detected_families = []
-    for r in results_out:
-        label = r["family"]
-        is_positive = r["detected"]
-        conf = r["confidence"]
-        conf_str = f"{conf:>11.1%}" if conf is not None else "    —"
-        status = "DETECTED" if is_positive else "clean"
-        marker = "[!]" if is_positive else "[+]"
-        print(f"{marker} {label:17s} {status:12s} {conf_str}")
-        if is_positive:
-            detected_families.append(r)
-
-    print("=" * 56)
-
-    if detected_families:
-        print(f"\n[!] {len(detected_families)} malware family(s) flagged:")
-        for r in detected_families:
-            bar = "█" * int(r["confidence"] * 20) if r["confidence"] else ""
-            print(f"    • {r['family']:15s} {r['confidence']:>6.1%} {bar}")
+        output = {
+            "dump":          str(dump_path),
+            "sha256":        sha256,
+            "cache_hit":     cache_hit,
+            "infected":      is_infected,
+            "infected_conf": round(binary_conf, 4) if binary_conf is not None else None,
+            "families":      None,
+        }
     else:
-        print("\n[+] No known malware families detected.")
+        conf_str = f"{binary_conf:.1%}" if binary_conf is not None else "n/a"
+        status   = "INFECTED" if is_infected else "CLEAN"
+        marker   = "[!]" if is_infected else "[+]"
+        print(f"\n{'=' * 56}")
+        print("STAGE 1 -- BINARY TRIAGE")
+        print(f"{'=' * 56}")
+        print(f"{marker} Status: {status}  (confidence: {conf_str})")
+
+    # -- Stage 2 — family identification (only if infected) -------------------
+    family_results = None
+
+    if is_infected:
+        family_results = stage2_families(
+            family_model, family_features, label_names, X_raw, args.threshold
+        )
+        if args.json:
+            output["families"] = family_results
+        else:
+            print("\nSTAGE 2 -- FAMILY IDENTIFICATION")
+            print_family_table(family_results)
+    else:
+        if not args.json:
+            print("\n[+] Stage 2 skipped -- machine is clean.\n")
+
+    # -- Persist scan record --------------------------------------------------
+    elapsed_scan = time.monotonic() - t_scan
+
+    scan_id = _db.insert_scan(
+        con,
+        dump_id=dump_id,
+        extraction_id=extraction_id,
+        pipeline="binary+family" if is_infected else "binary",
+        binary_model=args.binary_model,
+        family_model=args.model,
+        cache_hit=cache_hit,
+        elapsed_sec=elapsed_scan,
+        stage1_infected=is_infected,
+        stage1_conf=binary_conf,
+    )
+
+    if family_results:
+        _db.insert_verdicts(con, scan_id, family_results)
+
+    con.close()
+
+    # -- Emit JSON ------------------------------------------------------------
+    if args.json:
+        print(_json.dumps(output, indent=2))
+
+
+if __name__ == "__main__":
+    main()

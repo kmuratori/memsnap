@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# utils/dumper — automated dataset generator for MemSnap
+# scripts/dumper — automated dataset generator for MemSnap
 #
 # Drives the infect pipeline to capture a labeled memory dump for:
 #   - a clean baseline
@@ -7,7 +7,7 @@
 #   - every pair of attacks (optional, --pairs flag)
 #
 # Usage:
-#   ./utils/dumper -o <output_dir> [--pairs] [--attacks a,b,c] [--dry-run]
+#   ./scripts/dumper -o <output_dir> [--pairs] [--attacks a,b,c] [--dry-run]
 #
 # Output structure:
 #   <output_dir>/
@@ -26,14 +26,14 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INFECT="$PROJECT_ROOT/scripts/infect"
 ATTACKS_DIR="$PROJECT_ROOT/scripts/attacks"
 
-# ── defaults ──────────────────────────────────────────────────────────────────
+# -- defaults -----------------------------------------------------------------
 OUTPUT_DIR="./dataset"
 DO_PAIRS=false
 DRY_RUN=false
 SETTLE_SECS=3          # seconds to wait after install before capture
 SELECTED_ATTACKS=()    # empty = auto-discover from attacks dir
 
-# ── colour helpers ────────────────────────────────────────────────────────────
+# -- colour helpers -----------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; RESET='\033[0m'; BOLD='\033[1m'
 
@@ -41,7 +41,7 @@ info()    { echo -e "${CYAN}[*]${RESET} $*"; }
 ok()      { echo -e "${GREEN}[+]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
 err()     { echo -e "${RED}[-]${RESET} $*" >&2; }
-section() { echo -e "\n${BOLD}${CYAN}══ $* ══${RESET}"; }
+section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 
 usage() {
     cat <<EOF
@@ -59,7 +59,7 @@ EOF
     exit 0
 }
 
-# ── argument parsing ──────────────────────────────────────────────────────────
+# -- argument parsing ---------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -o)         OUTPUT_DIR="$2"; shift 2 ;;
@@ -72,7 +72,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── resolve attack list ───────────────────────────────────────────────────────
+# -- resolve attack list ------------------------------------------------------
 if [ ${#SELECTED_ATTACKS[@]} -eq 0 ]; then
     while IFS= read -r -d '' f; do
         [[ -x "$f" ]] && SELECTED_ATTACKS+=("$(basename "$f")")
@@ -87,14 +87,12 @@ fi
 MANIFEST="$OUTPUT_DIR/manifest.jsonl"
 AVML_BIN="${HOME}/.local/bin/avml"
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# -- helpers ------------------------------------------------------------------
 
 _ensure_clean() {
-    # Force a full cleanup regardless of queue state
     info "Ensuring clean state before capture..."
     "$INFECT" -R || true
     sleep 1
-    # Verify via status
     local active
     active=$("$INFECT" -s 2>/dev/null || true)
     if echo "$active" | grep -q "Active:"; then
@@ -113,9 +111,9 @@ _ensure_avml() {
 }
 
 _capture() {
-    local label="$1"      # human-readable label for the dump
-    local dest_dir="$2"   # directory to place the dump in
-    local attacks_str="$3" # space-separated list of active attacks (or 'clean')
+    local label="$1"       # human-readable label for the dump
+    local dest_dir="$2"    # directory to place the dump in
+    local attacks_str="$3" # comma-separated quoted attack names (or '"clean"')
 
     mkdir -p "$dest_dir"
     local ts filename
@@ -123,19 +121,19 @@ _capture() {
     filename="memdump_${ts}_${label}.raw"
 
     if $DRY_RUN; then
-        info "[dry-run] Would capture → $dest_dir/$filename"
+        info "[dry-run] Would capture -> $dest_dir/$filename"
         _manifest_entry "$label" "$dest_dir/$filename" "$attacks_str" "dry-run"
         return
     fi
 
-    info "Capturing → $dest_dir/$filename"
+    info "Capturing -> $dest_dir/$filename"
     sudo "$AVML_BIN" --compress "$dest_dir/$filename"
     ok "Saved: $dest_dir/$filename"
     _manifest_entry "$label" "$dest_dir/$filename" "$attacks_str" "ok"
 }
 
 _manifest_entry() {
-    local label="$1" path="$2" attacks="$3" status="$4"
+    local label="$1" path="$2" attacks_str="$3" status="$4"
     local ts
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     printf '{"timestamp":"%s","label":"%s","path":"%s","attacks":[%s],"status":"%s"}\n' \
@@ -163,12 +161,7 @@ _clean_attacks() {
     fi
 }
 
-_join_underscore() {
-    local IFS='_'
-    echo "$*"
-}
-
-# ── pre-flight ────────────────────────────────────────────────────────────────
+# -- pre-flight ---------------------------------------------------------------
 section "MemSnap Dumper"
 info "Attacks  : ${SELECTED_ATTACKS[*]}"
 info "Output   : $OUTPUT_DIR"
@@ -176,8 +169,8 @@ info "Pairs    : $DO_PAIRS"
 info "Dry-run  : $DRY_RUN"
 info "Settle   : ${SETTLE_SECS}s"
 
-total_captures=1                                    # baseline
-total_captures=$(( total_captures + ${#SELECTED_ATTACKS[@]} ))  # singles
+total_captures=1
+total_captures=$(( total_captures + ${#SELECTED_ATTACKS[@]} ))
 if $DO_PAIRS; then
     n=${#SELECTED_ATTACKS[@]}
     pairs=$(( n * (n - 1) / 2 ))
@@ -188,19 +181,18 @@ info "Planned captures: $total_captures"
 if ! $DRY_RUN; then
     _ensure_avml
     mkdir -p "$OUTPUT_DIR"
-    # Require root for capture (avml needs it)
     if [[ $EUID -ne 0 ]]; then
-        warn "Not running as root — sudo will be invoked for avml."
+        warn "Not running as root -- sudo will be invoked for avml."
         sudo -v || { err "sudo access required for memory capture"; exit 1; }
     fi
 fi
 
-# ── baseline ──────────────────────────────────────────────────────────────────
+# -- baseline -----------------------------------------------------------------
 section "Baseline (clean)"
 _ensure_clean
 _capture "clean" "$OUTPUT_DIR/clean" "\"clean\""
 
-# ── single-attack captures ────────────────────────────────────────────────────
+# -- single-attack captures ---------------------------------------------------
 section "Single-attack captures"
 for attack in "${SELECTED_ATTACKS[@]}"; do
     info "Attack: $attack"
@@ -211,7 +203,7 @@ for attack in "${SELECTED_ATTACKS[@]}"; do
     ok "Done: $attack"
 done
 
-# ── pairwise captures (optional) ──────────────────────────────────────────────
+# -- pairwise captures (optional) ---------------------------------------------
 if $DO_PAIRS; then
     section "Pairwise captures"
     n=${#SELECTED_ATTACKS[@]}
@@ -230,7 +222,7 @@ if $DO_PAIRS; then
     done
 fi
 
-# ── final cleanup ─────────────────────────────────────────────────────────────
+# -- final cleanup ------------------------------------------------------------
 section "Final cleanup"
 _ensure_clean
 ok "All captures complete."
