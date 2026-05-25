@@ -42,7 +42,6 @@
       transparent, transparent 2px,
       rgba(0,0,0,0.06) 2px, rgba(0,0,0,0.06) 4px);
   }
-
   /* grid bg */
   body::after {
     content: ''; position: fixed; inset: 0; z-index: 0; pointer-events: none;
@@ -52,27 +51,20 @@
     background-size: 40px 40px;
   }
 
-  .app {
-    position: relative; z-index: 1;
-    max-width: 860px; margin: 0 auto;
-    padding: 40px 24px 80px;
-  }
+  .app { position: relative; z-index: 1; max-width: 860px; margin: 0 auto; padding: 40px 24px 80px; }
 
-  /* -- Header -- */
+  /* ── Header ── */
   header {
     display: flex; align-items: flex-end; justify-content: space-between;
     border-bottom: 1px solid var(--border-hi);
-    padding-bottom: 20px; margin-bottom: 40px;
+    padding-bottom: 20px; margin-bottom: 24px;
   }
   .logo-eyebrow {
     font-family: 'Share Tech Mono', monospace;
     font-size: 0.65rem; letter-spacing: 0.25em;
     color: var(--accent); margin-bottom: 4px;
   }
-  .logo-title {
-    font-size: 2.6rem; font-weight: 700; line-height: 1;
-    letter-spacing: -0.02em; color: #fff;
-  }
+  .logo-title { font-size: 2.6rem; font-weight: 700; line-height: 1; letter-spacing: -0.02em; color: #fff; }
   .logo-title span { color: var(--accent); }
   .header-meta {
     font-family: 'Share Tech Mono', monospace;
@@ -87,25 +79,47 @@
   }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
-  /* -- Section label -- */
+  /* ── Top nav ── */
+  .top-nav {
+    display: flex; gap: 8px; margin-bottom: 28px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+  }
+  .nav-btn {
+    background: none; border: none; outline: none; cursor: pointer;
+    font-family: 'Share Tech Mono', monospace; font-size: 0.72rem;
+    letter-spacing: 0.18em; color: var(--text-dim);
+    padding: 6px 14px; border: 1px solid transparent;
+    transition: color 0.2s, border-color 0.2s;
+  }
+  .nav-btn:hover { color: var(--text); }
+  .nav-btn.active {
+    color: var(--accent); border-color: var(--border-hi);
+    background: var(--panel);
+  }
+
+  /* ── Pages ── */
+  .page { display: none; }
+  .page.active { display: block; }
+
   .section-label {
     font-family: 'Share Tech Mono', monospace;
     font-size: 0.65rem; letter-spacing: 0.2em;
     color: var(--text-dim); margin-bottom: 12px;
   }
 
-  /* -- 2-column upload grid -- */
+  /* ── Upload grid ── */
   .upload-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1.2fr 1fr 1fr;
     gap: 16px;
     margin-bottom: 24px;
   }
-  @media (max-width: 580px) {
+  @media (max-width: 640px) {
     .upload-grid { grid-template-columns: 1fr; }
   }
 
-  /* -- Drop zone card -- */
+  /* ── Drop cards ── */
   .drop-card {
     position: relative;
     background: var(--panel);
@@ -117,20 +131,15 @@
     flex-direction: column;
   }
   .drop-card::before {
-    content: ''; position: absolute; inset: 0; pointer-events: none;
-    opacity: 0; transition: opacity 0.3s;
+    content: ''; position: absolute; inset: 0; pointer-events: none; opacity: 0; transition: opacity 0.3s;
   }
-  /* dump card glow colour */
   .drop-card.dump-card::before {
     background: radial-gradient(ellipse at 50% 0%, rgba(0,229,255,0.07) 0%, transparent 70%);
   }
-  /* model card glow colour */
   .drop-card.model-card::before {
     background: radial-gradient(ellipse at 50% 0%, rgba(123,47,255,0.09) 0%, transparent 70%);
   }
-  .drop-card:hover::before,
-  .drop-card.dragover::before { opacity: 1; }
-
+  .drop-card:hover::before, .drop-card.dragover::before { opacity: 1; }
   .drop-card.dragover {
     border-style: solid;
     border-color: var(--accent);
@@ -139,15 +148,11 @@
   .drop-card.has-file.dump-card  { border-style: solid; border-color: var(--accent); }
   .drop-card.has-file.model-card { border-style: solid; border-color: var(--accent2); box-shadow: var(--glow2); }
 
-  /* card inner padding */
   .drop-card-body {
-    padding: 32px 24px 28px;
+    padding: 28px 20px 24px;
     display: flex; flex-direction: column;
-    align-items: center; text-align: center;
-    flex: 1;
+    align-items: center; text-align: center; flex: 1;
   }
-
-  /* icon box */
   .drop-icon {
     width: 42px; height: 42px; margin-bottom: 14px;
     border: 1px solid var(--border-hi);
@@ -159,10 +164,7 @@
   .drop-card.has-file.model-card .drop-icon { border-color: var(--accent2); box-shadow: 0 0 12px rgba(123,47,255,0.3); }
   .drop-icon svg { width: 18px; height: 18px; }
 
-  .drop-card-title {
-    font-size: 0.85rem; font-weight: 700;
-    color: #fff; letter-spacing: 0.04em; margin-bottom: 6px;
-  }
+  .drop-card-title { font-size: 0.85rem; font-weight: 700; color: #fff; letter-spacing: 0.04em; margin-bottom: 6px; }
   .drop-card-sub {
     font-family: 'Share Tech Mono', monospace;
     font-size: 0.62rem; color: var(--text-dim);
@@ -171,7 +173,6 @@
   .drop-card-sub span { color: var(--accent); }
   .drop-card.model-card .drop-card-sub span { color: var(--accent2); }
 
-  /* file strip at bottom of card */
   .card-strip {
     display: none;
     background: var(--surface);
@@ -196,10 +197,9 @@
   }
   .card-strip-remove:hover { color: var(--danger); }
 
-  /* hidden inputs */
   input[type="file"] { display: none; }
 
-  /* -- Analyze button -- */
+  /* ── Analyze button ── */
   .analyze-btn {
     width: 100%; padding: 14px 24px;
     background: var(--accent); border: none; outline: none;
@@ -221,10 +221,9 @@
   .analyze-btn.scanning::after { animation: shimmer 1.2s ease-in-out infinite; }
   @keyframes shimmer { 100%{ transform: translateX(100%); } }
 
-  /* -- Progress -- */
+  /* ── Progress ── */
   .progress-wrap { display: none; margin-bottom: 28px; }
   .progress-wrap.visible { display: block; }
-
   .progress-header {
     display: flex; justify-content: space-between;
     align-items: baseline; margin-bottom: 8px;
@@ -268,8 +267,13 @@
     border-radius: 50%; animation: spin 0.7s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .cached-mini {
+    margin-left: auto;
+    font-size: 0.55rem; color: var(--text-dim);
+    border: 1px solid var(--border); padding: 1px 5px; letter-spacing: 0.08em;
+  }
 
-  /* -- Error -- */
+  /* ── Error ── */
   .error-block {
     display: none; background: rgba(255,56,96,0.06);
     border: 1px solid rgba(255,56,96,0.3);
@@ -279,7 +283,7 @@
   }
   .error-block.visible { display: block; }
 
-  /* -- Results -- */
+  /* ── Results ── */
   .results { display: none; }
   .results.visible { display: block; }
 
@@ -299,50 +303,120 @@
     font-size: 0.7rem; color: var(--text-dim);
   }
 
-  .threat-grid {
-    display: grid; grid-template-columns: repeat(3, 1fr);
+  /* SHA row */
+  .sha-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 20px;
+    background: var(--surface);
     border: 1px solid var(--border); border-top: none;
-    margin-bottom: 24px;
+    font-family: 'Share Tech Mono', monospace; font-size: 0.7rem;
   }
-  @media (max-width: 560px) { .threat-grid { grid-template-columns: 1fr; } }
+  .sha-label { color: var(--text-dim); letter-spacing: 0.1em; white-space: nowrap; }
+  .sha-hash { color: var(--text-mono); word-break: break-all; }
+  .cached-badge {
+    display: none;
+    font-size: 0.55rem; color: var(--accent);
+    border: 1px solid var(--accent); padding: 1px 6px;
+    letter-spacing: 0.1em; white-space: nowrap;
+  }
+  .cached-badge.visible { display: inline-block; }
 
-  .threat-card {
-    background: var(--surface); padding: 20px 18px;
-    border-right: 1px solid var(--border);
-    position: relative; overflow: hidden;
+  /* Stage 1 block */
+  .stage1-block {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 20px;
+    background: var(--panel);
+    border: 1px solid var(--border); border-top: none;
   }
-  .threat-card:last-child { border-right: none; }
-  .threat-card::before {
-    content: ''; position: absolute;
-    top: 0; left: 0; right: 0; height: 2px;
-  }
-  .threat-card.detected::before { background: var(--danger); }
-  .threat-card.clean::before    { background: var(--safe); }
-  .threat-card.detected         { background: rgba(255,56,96,0.04); }
-
-  .threat-card-label {
+  .stage1-label {
     font-family: 'Share Tech Mono', monospace;
-    font-size: 0.65rem; color: var(--text-dim);
-    letter-spacing: 0.18em; text-transform: uppercase; margin-bottom: 10px;
+    font-size: 0.65rem; color: var(--text-dim); letter-spacing: 0.15em;
+    white-space: nowrap;
   }
-  .threat-card-status { font-size: 1rem; font-weight: 700; letter-spacing: 0.06em; }
-  .threat-card.detected .threat-card-status { color: var(--danger); }
-  .threat-card.clean    .threat-card-status { color: var(--safe); }
-
-  .threat-badge {
-    display: inline-block; margin-top: 8px;
+  .stage1-status {
+    font-size: 0.9rem; font-weight: 700; letter-spacing: 0.06em;
+    white-space: nowrap;
+  }
+  .stage1-status.infected { color: var(--danger); }
+  .stage1-status.clean    { color: var(--safe); }
+  .stage1-bar-wrap {
+    flex: 1; height: 4px; background: var(--border); overflow: hidden;
+  }
+  .stage1-bar {
+    height: 100%; width: 0%; background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+    transition: width 0.5s ease;
+  }
+  .stage1-bar.infected { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+  .stage1-bar.clean    { background: var(--safe);   box-shadow: 0 0 6px var(--safe); }
+  .stage1-pct {
     font-family: 'Share Tech Mono', monospace;
-    font-size: 0.6rem; letter-spacing: 0.12em; padding: 2px 8px;
-  }
-  .threat-card.detected .threat-badge {
-    background: rgba(255,56,96,0.15); color: var(--danger);
-    border: 1px solid rgba(255,56,96,0.3);
-  }
-  .threat-card.clean .threat-badge {
-    background: rgba(0,229,160,0.1); color: var(--safe);
-    border: 1px solid rgba(0,229,160,0.25);
+    font-size: 0.7rem; color: var(--text-mono); min-width: 40px; text-align: right;
   }
 
+  /* Threat table */
+  .threat-table-wrap {
+    border: 1px solid var(--border); border-top: none;
+    margin-bottom: 20px;
+  }
+  .threat-table {
+    width: 100%; border-collapse: collapse;
+    font-family: 'Share Tech Mono', monospace; font-size: 0.75rem;
+  }
+  .threat-table th {
+    text-align: left; padding: 10px 16px;
+    color: var(--text-dim); letter-spacing: 0.15em;
+    font-weight: 400; border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .threat-table td { padding: 10px 16px; vertical-align: middle; }
+  .threat-table tr.row-detected { background: rgba(255,56,96,0.04); }
+  .threat-table tr.row-detected td { color: var(--text); }
+  .threat-table td { color: var(--text-dim); }
+  .col-family { font-weight: 600; letter-spacing: 0.04em; }
+  .status-badge {
+    display: inline-block; padding: 2px 8px; font-size: 0.65rem; letter-spacing: 0.1em;
+    border: 1px solid;
+  }
+  .status-badge.detected { color: var(--danger); border-color: rgba(255,56,96,0.4); background: rgba(255,56,96,0.1); }
+  .status-badge.clear    { color: var(--safe);   border-color: rgba(0,229,160,0.3); background: rgba(0,229,160,0.08); }
+  .conf-bar-wrap {
+    display: inline-block; width: 80px; height: 3px; background: var(--border); vertical-align: middle; margin-right: 8px;
+  }
+  .conf-bar { height: 100%; background: var(--accent); }
+  .conf-bar.detected { background: var(--danger); }
+  .conf-pct { font-size: 0.7rem; color: var(--text-mono); }
+
+  /* Save strip */
+  .save-strip {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; background: var(--surface);
+    border: 1px solid var(--border); border-top: none;
+    margin-bottom: 20px;
+  }
+  .scan-id-label {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.7rem; color: var(--text-dim); white-space: nowrap;
+  }
+  #label-input {
+    flex: 1;
+    background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 6px 10px;
+    font-family: 'Share Tech Mono', monospace; font-size: 0.7rem;
+    outline: none;
+  }
+  #label-input:focus { border-color: var(--border-hi); }
+  .save-btn, .download-btn {
+    background: var(--panel); border: 1px solid var(--border);
+    color: var(--text); cursor: pointer;
+    font-family: 'Share Tech Mono', monospace; font-size: 0.65rem;
+    letter-spacing: 0.1em; padding: 6px 12px;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .save-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .download-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+
+  /* Features block */
   .features-block {
     background: var(--panel);
     border: 1px solid var(--border); padding: 16px 20px;
@@ -358,10 +432,66 @@
     padding: 8px 0;
     font-family: 'Share Tech Mono', monospace; font-size: 0.75rem;
   }
-  .features-table td:first-child { color: var(--text-dim); width: 55%; }
+  .features-table td:first-child { color: var(--text-dim); width: 60%; }
   .features-table td:last-child  { color: var(--accent); text-align: right; }
+  .reserved {
+    font-size: 0.6rem; color: var(--text-dim); letter-spacing: 0.08em;
+  }
 
-  /* -- Footer -- */
+  /* ── History page ── */
+  .history-list { display: flex; flex-direction: column; gap: 12px; }
+  .history-empty, .history-loading {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.75rem; color: var(--text-dim); padding: 20px 0;
+  }
+  .history-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 14px 18px;
+    transition: border-color 0.2s;
+    position: relative;
+  }
+  .history-card:hover { border-color: var(--border-hi); }
+  .history-header {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 6px;
+  }
+  .history-id {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.75rem; color: var(--accent);
+  }
+  .history-name {
+    flex: 1; font-size: 0.9rem; font-weight: 600; color: #fff;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .history-badge {
+    font-family: 'Share Tech Mono', monospace; font-size: 0.65rem;
+    letter-spacing: 0.1em; padding: 2px 8px; border: 1px solid;
+  }
+  .history-badge.infected { color: var(--danger); border-color: rgba(255,56,96,0.4); }
+  .history-badge.clean    { color: var(--safe);   border-color: rgba(0,229,160,0.3); }
+  .history-meta {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.65rem; color: var(--text-dim); margin-bottom: 10px;
+    display: flex; gap: 12px; flex-wrap: wrap;
+  }
+  .cached-pill {
+    font-size: 0.55rem; color: var(--accent);
+    border: 1px solid var(--accent); padding: 1px 5px; margin-left: 6px;
+  }
+  .history-label {
+    font-size: 0.6rem; color: var(--text-mono);
+    border: 1px solid var(--border); padding: 1px 6px;
+  }
+  .history-view {
+    position: absolute; right: 14px; bottom: 14px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); cursor: pointer;
+    font-family: 'Share Tech Mono', monospace; font-size: 0.65rem;
+    letter-spacing: 0.1em; padding: 5px 12px;
+  }
+  .history-view:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ── Footer ── */
   footer {
     margin-top: 60px; padding-top: 20px;
     border-top: 1px solid var(--border);
@@ -378,6 +508,7 @@
     border: 1px solid var(--border); padding: 2px 7px; letter-spacing: 0.06em;
   }
 </style>
+<base target="_blank">
 </head>
 <body>
 <div class="app">
@@ -390,138 +521,218 @@
     </div>
     <div class="header-meta">
       <div><span class="status-dot"></span>SYSTEM READY</div>
-      <div>MEMORY THREAT ANALYSIS v0</div>
+      <div>MEMORY THREAT ANALYSIS v1</div>
     </div>
   </header>
 
-  <!-- Upload section label -->
-  <div class="section-label">// upload files</div>
+  <!-- Nav -->
+  <nav class="top-nav">
+    <button class="nav-btn active" data-page="scan" onclick="showPage('scan')">SCAN</button>
+    <button class="nav-btn" data-page="history" onclick="showPage('history')">HISTORY</button>
+  </nav>
 
-  <!-- 2-column upload grid -->
-  <div class="upload-grid">
+  <!-- ═══════════════════════  SCAN PAGE  ═══════════════════════ -->
+  <div class="page active" data-page="scan">
 
-    <!-- LEFT: Memory dump -->
-    <div class="drop-card dump-card" id="dump-card"
-         onclick="document.getElementById('file-input').click()"
-         ondragover="cardDragOver(event,'dump-card')"
-         ondragleave="cardDragLeave('dump-card')"
-         ondrop="cardDrop(event,'dump')">
-      <div class="drop-card-body">
-        <div class="drop-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#00e5ff"
-               stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="17 8 12 3 7 8"/>
-            <line x1="12" y1="3" x2="12" y2="15"/>
+    <div class="section-label">// upload files</div>
+
+    <!-- Upload grid: dump + binary model + family model -->
+    <div class="upload-grid">
+
+      <!-- Dump -->
+      <div class="drop-card dump-card" id="dump-card"
+           onclick="document.getElementById('file-input').click()"
+           ondragover="cardDragOver(event,'dump-card')"
+           ondragleave="cardDragLeave('dump-card')"
+           ondrop="cardDrop(event,'dump')">
+        <div class="drop-card-body">
+          <div class="drop-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#00e5ff"
+                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          </div>
+          <div class="drop-card-title">Memory Dump</div>
+          <div class="drop-card-sub">
+            Drop or click to browse<br>
+            <span>.raw</span> · <span>.lime</span> · <span>.mem</span> ·
+            <span>.vmem</span> · <span>.dmp</span>
+          </div>
+        </div>
+        <div class="card-strip" id="dump-strip">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#00e5ff"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+            <polyline points="13 2 13 9 20 9"/>
           </svg>
-        </div>
-        <div class="drop-card-title">Memory Dump</div>
-        <div class="drop-card-sub">
-          Drop or click to browse<br>
-          <span>.raw</span> · <span>.lime</span> · <span>.mem</span> ·
-          <span>.vmem</span> · <span>.dmp</span>
+          <span class="card-strip-name" id="dump-strip-name">-</span>
+          <span class="card-strip-size" id="dump-strip-size">-</span>
+          <button class="card-strip-remove" onclick="removeDump(event)">✕</button>
         </div>
       </div>
-      <div class="card-strip" id="dump-strip">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#00e5ff"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
-          <polyline points="13 2 13 9 20 9"/>
-        </svg>
-        <span class="card-strip-name" id="dump-strip-name">-</span>
-        <span class="card-strip-size" id="dump-strip-size">-</span>
-        <button class="card-strip-remove" onclick="removeDump(event)">✕</button>
-      </div>
-    </div>
 
-    <!-- RIGHT: Model -->
-    <div class="drop-card model-card" id="model-card"
-         onclick="document.getElementById('model-input').click()"
-         ondragover="cardDragOver(event,'model-card')"
-         ondragleave="cardDragLeave('model-card')"
-         ondrop="cardDrop(event,'model')">
-      <div class="drop-card-body">
-        <div class="drop-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#7b2fff"
-               stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <!-- Binary model -->
+      <div class="drop-card model-card" id="binary-card"
+           onclick="document.getElementById('binary-input').click()"
+           ondragover="cardDragOver(event,'binary-card')"
+           ondragleave="cardDragLeave('binary-card')"
+           ondrop="cardDrop(event,'binary')">
+        <div class="drop-card-body">
+          <div class="drop-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#7b2fff"
+                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <ellipse cx="12" cy="5" rx="9" ry="3"/>
+              <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+              <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+            </svg>
+          </div>
+          <div class="drop-card-title">Stage 1 Model</div>
+          <div class="drop-card-sub">
+            Binary triage classifier<br>
+            <span>.joblib</span> &nbsp;·&nbsp; optional
+          </div>
+        </div>
+        <div class="card-strip" id="binary-strip">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#7b2fff"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <ellipse cx="12" cy="5" rx="9" ry="3"/>
             <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
             <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
           </svg>
-        </div>
-        <div class="drop-card-title">ML Model</div>
-        <div class="drop-card-sub">
-          Drop or click to browse<br>
-          <span>.pkl</span> &nbsp;·&nbsp; optional, uses default if omitted
+          <span class="card-strip-name" id="binary-strip-name">-</span>
+          <span class="card-strip-size" id="binary-strip-size">-</span>
+          <button class="card-strip-remove" onclick="removeBinaryModel(event)">✕</button>
         </div>
       </div>
-      <div class="card-strip" id="model-strip">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#7b2fff"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <ellipse cx="12" cy="5" rx="9" ry="3"/>
-          <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
-          <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
-        </svg>
-        <span class="card-strip-name" id="model-strip-name">-</span>
-        <span class="card-strip-size" id="model-strip-size">-</span>
-        <button class="card-strip-remove" onclick="removeModel(event)">✕</button>
+
+      <!-- Family model -->
+      <div class="drop-card model-card" id="family-card"
+           onclick="document.getElementById('family-input').click()"
+           ondragover="cardDragOver(event,'family-card')"
+           ondragleave="cardDragLeave('family-card')"
+           ondrop="cardDrop(event,'family')">
+        <div class="drop-card-body">
+          <div class="drop-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#7b2fff"
+                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <ellipse cx="12" cy="5" rx="9" ry="3"/>
+              <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+              <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+            </svg>
+          </div>
+          <div class="drop-card-title">Stage 2 Model</div>
+          <div class="drop-card-sub">
+            Family identification<br>
+            <span>.joblib</span> &nbsp;·&nbsp; optional
+          </div>
+        </div>
+        <div class="card-strip" id="family-strip">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#7b2fff"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <ellipse cx="12" cy="5" rx="9" ry="3"/>
+            <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+            <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+          </svg>
+          <span class="card-strip-name" id="family-strip-name">-</span>
+          <span class="card-strip-size" id="family-strip-size">-</span>
+          <button class="card-strip-remove" onclick="removeFamilyModel(event)">✕</button>
+        </div>
+      </div>
+
+    </div><!-- /upload-grid -->
+
+    <input type="file" id="file-input"
+         accept=".raw,.lime,.mem,.vmem,.bin,.dmp,.img,.dd" />
+    <input type="file" id="binary-input" accept=".joblib" />
+    <input type="file" id="family-input" accept=".joblib" />
+
+    <!-- Analyze -->
+    <button class="analyze-btn" id="analyze-btn" onclick="runAnalysis()" disabled>
+      <span id="btn-label">SCAN MEMORY DUMP</span>
+    </button>
+
+    <!-- Progress -->
+    <div class="progress-wrap" id="progress-wrap">
+      <div class="progress-header">
+        <span class="progress-label" id="progress-stage">INITIALIZING</span>
+        <span class="progress-pct"   id="progress-pct">0%</span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div class="progress-steps" id="progress-steps"></div>
+    </div>
+
+    <!-- Error -->
+    <div class="error-block" id="error-block"></div>
+
+    <!-- Results -->
+    <div class="results" id="results">
+      <div class="results-header">
+        <div class="results-verdict"  id="results-verdict">-</div>
+        <div class="results-filename" id="results-filename">-</div>
+      </div>
+
+      <div class="sha-row" id="results-sha">
+        <span class="sha-label">SHA-256</span>
+        <span class="sha-hash" id="sha-hash">-</span>
+        <span class="cached-badge" id="cached-badge">CACHED</span>
+      </div>
+
+      <div class="stage1-block" id="stage1-block"></div>
+
+      <div class="threat-table-wrap">
+        <table class="threat-table">
+          <thead>
+            <tr>
+              <th>FAMILY</th>
+              <th>STATUS</th>
+              <th>CONFIDENCE</th>
+            </tr>
+          </thead>
+          <tbody id="threat-tbody"></tbody>
+        </table>
+      </div>
+
+      <div class="save-strip">
+        <span class="scan-id-label">SCAN <span id="save-scan-id">—</span></span>
+        <input type="text" id="label-input" placeholder="label..." />
+        <button class="save-btn" id="save-btn" onclick="saveLabel()">SAVE</button>
+        <button class="download-btn" onclick="downloadResult()">↓ JSON</button>
+      </div>
+
+      <div class="features-block">
+        <div class="features-title">// extracted features</div>
+        <table class="features-table" id="features-table"></table>
       </div>
     </div>
 
-  </div><!-- /upload-grid -->
+  </div><!-- /page-scan -->
 
-  <!-- hidden file inputs -->
-  <input type="file" id="file-input"
-       accept=".raw,.lime,.mem,.vmem,.bin,.dmp,.img,.dd" />
-  <input type="file" id="model-input"
-       accept=".pkl" />
-
-  <!-- Analyze -->
-  <button class="analyze-btn" id="analyze-btn" onclick="runAnalysis()" disabled>
-    <span id="btn-label">SCAN MEMORY DUMP</span>
-  </button>
-
-  <!-- Progress -->
-  <div class="progress-wrap" id="progress-wrap">
-    <div class="progress-header">
-      <span class="progress-label" id="progress-stage">INITIALIZING</span>
-      <span class="progress-pct"   id="progress-pct">0%</span>
-    </div>
-    <div class="progress-track">
-      <div class="progress-bar" id="progress-bar"></div>
-    </div>
-    <div class="progress-steps" id="progress-steps"></div>
-  </div>
-
-  <!-- Error -->
-  <div class="error-block" id="error-block"></div>
-
-  <!-- Results -->
-  <div class="results" id="results">
-    <div class="results-header">
-      <div class="results-verdict"  id="results-verdict">-</div>
-      <div class="results-filename" id="results-filename">-</div>
-    </div>
-    <div class="threat-grid"    id="threat-grid"></div>
-    <div class="features-block">
-      <div class="features-title">// extracted features</div>
-      <table class="features-table" id="features-table"></table>
-    </div>
+  <!-- ═══════════════════════  HISTORY PAGE  ═══════════════════════ -->
+  <div class="page" data-page="history">
+    <div class="section-label">// select a scan to view results</div>
+    <div class="history-list" id="history-list"></div>
   </div>
 
   <!-- Footer -->
   <footer>
     <div class="footer-left">PLUGINS LOADED</div>
     <div class="footer-plugins">
-      <span class="plugin-tag">linux.pslist</span>
-      <span class="plugin-tag">linux.psscan</span>
-      <span class="plugin-tag">linux.hidden_modules</span>
-      <span class="plugin-tag">linux.sockstat</span>
-      <span class="plugin-tag">linux.lsof</span>
+      <span class="plugin-tag">PsList</span>
+      <span class="plugin-tag">PsScan</span>
+      <span class="plugin-tag">Check_syscall</span>
+      <span class="plugin-tag">Hidden_modules</span>
+      <span class="plugin-tag">Sockstat</span>
+      <span class="plugin-tag">Malfind</span>
+      <span class="plugin-tag">Netfilter</span>
+      <span class="plugin-tag">Maps</span>
     </div>
   </footer>
 
 </div>
-<script defer src="/assets/app.js"></script>
+<script defer src="/assets/web/app.js"></script>
 </body>
 </html>

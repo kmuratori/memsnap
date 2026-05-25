@@ -12,7 +12,7 @@ Public API
 get_connection(db_path)                            -> sqlite3.Connection
 
 # Dump
-upsert_dump(con, sha256, size_bytes, path)         -> dump_id
+upsert_dump(con, sha256, size_bytes, path, dump_name) -> dump_id
 
 # Extraction
 get_cached_extraction(con, dump_id)                -> extraction_id | None
@@ -99,6 +99,7 @@ def upsert_dump(
     sha256: str,
     size_bytes: int,
     path: str,
+    dump_name: str | None = None,
 ) -> int:
     """Insert a new dump row or update last_seen_path for an existing one.
 
@@ -110,16 +111,16 @@ def upsert_dump(
 
     if row:
         con.execute(
-            "UPDATE dumps SET last_seen_path = ? WHERE sha256 = ?",
-            (path, sha256),
+            "UPDATE dumps SET last_seen_path = ?, dump_name = ? WHERE sha256 = ?",
+            (path, dump_name, sha256),
         )
         con.commit()
         return int(row["id"])
 
     cur = con.execute(
-        "INSERT INTO dumps (sha256, size_bytes, first_seen_at, last_seen_path)"
-        " VALUES (?, ?, ?, ?)",
-        (sha256, size_bytes, _now(), path),
+        "INSERT INTO dumps (sha256, size_bytes, first_seen_at, last_seen_path, dump_name)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (sha256, size_bytes, _now(), path, dump_name),
     )
     con.commit()
     return int(cur.lastrowid)
@@ -191,27 +192,33 @@ def insert_features(
     extraction_id: int,
     features: dict[str, Any],
 ) -> None:
-    """Persist the 7 scalar features that the DB schema tracks.
+    """Persist the 12 scalar features that the DB schema tracks.
 
-    Extra keys in *features* (e.g. dead features, _elapsed helpers) are
-    silently ignored — only the columns defined in 0001.sql are written.
+    Extra keys in *features* (e.g. _elapsed helpers) are silently ignored.
     """
     COLS = [
         "hidden_proc_count",
         "masqueraded_proc_count",
+        "deleted_exe_count",
+        "hooked_syscall_count",
         "hidden_module_count",
+        "netfilter_hook_count",
         "rwx_region_count",
         "total_sockets",
         "raw_socket_count",
+        "foreign_conn_count",
+        "high_port_count",
         "unknown_lib_count",
     ]
     vals = tuple(features.get(c) for c in COLS)
     con.execute(
         "INSERT OR REPLACE INTO features"
         " (extraction_id,"
-        "  hidden_proc_count, masqueraded_proc_count, hidden_module_count,"
-        "  rwx_region_count, total_sockets, raw_socket_count, unknown_lib_count)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "  hidden_proc_count, masqueraded_proc_count, deleted_exe_count,"
+        "  hooked_syscall_count, hidden_module_count, netfilter_hook_count,"
+        "  rwx_region_count, total_sockets, raw_socket_count,"
+        "  foreign_conn_count, high_port_count, unknown_lib_count)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (extraction_id, *vals),
     )
     con.commit()

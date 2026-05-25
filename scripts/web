@@ -1,203 +1,445 @@
 #!/usr/bin/env python3
-"""Web interface for single-dump malware detection - runs on FastAPI."""
+"""Web interface for MemSnap — two-stage malware detection pipeline."""
 
 import asyncio
 import json
-import subprocess
+import sys
 import tempfile
-import uvicorn
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import joblib
 import pandas as pd
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+import uvicorn
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = SCRIPT_DIR / ".." / "assets"
-DEFAULT_MODEL = str(ASSETS_DIR / "model.pkl")
+SCRIPT_DIR   = Path(__file__).resolve().parent
+LIB_DIR      = SCRIPT_DIR / ".." / "lib"
+sys.path.insert(0, str(LIB_DIR))
 
-PLUGINS = [
-    "linux.pslist",
-    "linux.psscan",
-    "linux.hidden_modules",
-    "linux.sockstat",
-    "linux.lsof.Lsof",
-]
+ASSETS_DIR   = SCRIPT_DIR / ".." / "assets"
+SYMBOLS_DIR  = ASSETS_DIR / "symbols"
+DEFAULT_STAGE1 = ASSETS_DIR / "ai-model" / "binary_clf.joblib"
+DEFAULT_STAGE2 = ASSETS_DIR / "ai-model" / "family_clf.joblib"
 
-SENTINEL = -1
+from memsnap_lib import (
+    ALL_FEATURES,
+    BINARY_FEATURES,
+    DEAD_FEATURES,
+    LABELS,
+    PLUGINS,
+    compute_checksum,
+    extract_features,
+    load_model,
+    run_plugin,
+    stage1_binary,
+    stage2_families,
+)
+from db import (
+    get_connection,
+    upsert_dump,
+    get_cached_extraction,
+    insert_extraction,
+    insert_plugin_results,
+    insert_features,
+    load_features,
+    insert_scan,
+    finish_scan,
+    insert_verdicts,
+)
 
-app = FastAPI(title="MemScan - Memory Dump Threat Detector")
-
+app = FastAPI(title="MemSnap — Memory Threat Detector")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
 
 
-# ── Frontend ──────────────────────────────────────────────────────────────────
+# -- DB helpers (each opens its own connection in the thread) ----------------
+
+def _get_scans(limit=50):
+    con = get_connection()
+    try:
+        rows = con.execute("""
+            SELECT s.id, s.dump_id, s.label, s.elapsed_sec, s.started_at, s.cache_hit,
+                   d.sha256, d.size_bytes, d.dump_name
+            FROM scans s
+            JOIN dumps d ON d.id = s.dump_id
+            ORDER BY s.started_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        scans = {}
+        for r in rows:
+            sid = r["id"]
+            if sid not in scans:
+                scans[sid] = {
+                    "id": sid,
+                    "dump_id": r["dump_id"],
+                    "label": r["label"],
+                    "elapsed_sec": r["elapsed_sec"],
+                    "created_at": r["started_at"],
+                    "sha256": r["sha256"],
+                    "size_bytes": r["size_bytes"],
+                    "dump_name": r["dump_name"] or "unknown",
+                    "verdicts": [],
+                    "cached": bool(r["cache_hit"]),
+                }
+
+        if scans:
+            placeholders = ",".join("?" * len(scans))
+            vrows = con.execute(f"""
+                SELECT scan_id, family, detected, confidence
+                FROM verdicts
+                WHERE scan_id IN ({placeholders})
+            """, tuple(scans.keys())).fetchall()
+            for v in vrows:
+                scans[v["scan_id"]]["verdicts"].append({
+                    "family": v["family"],
+                    "detected": bool(v["detected"]),
+                    "confidence": v["confidence"],
+                })
+
+        out = []
+        for sid in sorted(scans.keys(), reverse=True):
+            s = scans[sid]
+            infected = [v for v in s["verdicts"] if v["detected"]]
+            s["any_detected"] = bool(infected)
+            s["confidence"] = max((v["confidence"] for v in infected), default=0.0)
+            out.append(s)
+        return out
+    finally:
+        con.close()
+
+
+def _get_scan_export(scan_id):
+    con = get_connection()
+    try:
+        scan = con.execute("""
+            SELECT s.id, s.extraction_id, s.elapsed_sec, s.started_at, s.label,
+                   s.stage1_infected, s.stage1_conf, s.cache_hit,
+                   d.sha256, d.size_bytes, d.dump_name, d.last_seen_path
+            FROM scans s
+            JOIN dumps d ON d.id = s.dump_id
+            WHERE s.id = ?
+        """, (scan_id,)).fetchone()
+
+        if not scan:
+            return None
+
+        features = load_features(con, scan["extraction_id"]) if scan["extraction_id"] else None
+        verdicts = con.execute("""
+            SELECT family, detected, confidence
+            FROM verdicts
+            WHERE scan_id = ?
+        """, (scan_id,)).fetchall()
+
+        return {
+            "scan_id": scan_id,
+            "filename": scan["dump_name"] or Path(scan["last_seen_path"]).name,
+            "sha256": scan["sha256"],
+            "created_at": scan["started_at"],
+            "elapsed_sec": scan["elapsed_sec"],
+            "label": scan["label"],
+            "cached": bool(scan["cache_hit"]),
+            "stage1": {
+                "infected": bool(scan["stage1_infected"]) if scan["stage1_infected"] is not None else False,
+                "confidence": round(scan["stage1_conf"] * 100, 1) if scan["stage1_conf"] is not None else 0.0,
+            },
+            "threats": [
+                {"family": v["family"], "detected": bool(v["detected"]), "confidence": v["confidence"]}
+                for v in verdicts
+            ],
+            "features": features or {},
+            "any_detected": any(v["detected"] for v in verdicts),
+        }
+    finally:
+        con.close()
+
+
+def _update_scan_label(scan_id, label):
+    con = get_connection()
+    try:
+        cur = con.execute("UPDATE scans SET label = ? WHERE id = ?", (label, scan_id))
+        con.commit()
+        return cur.rowcount > 0
+    finally:
+        con.close()
+
+
+# -- Routes -------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    html_path = ASSETS_DIR / "index.html"
+    html_path = ASSETS_DIR / "web" / "index.html"
     if html_path.exists():
         return HTMLResponse(content=html_path.read_text())
-    return HTMLResponse("<h1>index.html not found in assets/</h1>", status_code=404)
+    return HTMLResponse("<h1>index.html not found in assets/web/</h1>", status_code=404)
 
 
-# ── Volatility helpers ────────────────────────────────────────────────────────
-
-def run_plugin(dump_path: str, plugin: str) -> list:
-    cmd = [
-        "vol", "-f", dump_path,
-        "-s", str(ASSETS_DIR),
-        "--renderer", "json",
-        plugin,
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=400)
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return []
-        data = json.loads(proc.stdout)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("rows", data.get("data", []))
-        return []
-    except Exception:
-        return []
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
-# ── Streaming analysis ────────────────────────────────────────────────────────
+# -- Streaming analysis -------------------------------------------------------
 
-async def analyze_stream(dump_path: str, model_path: Path):
-    """Yields SSE lines with real per-plugin progress then the final result."""
-
+async def analyze_stream(
+    dump_path: str,
+    dump_name: str,
+    stage1_path: Path,
+    stage2_path: Path,
+    no_cache: bool,
+):
     def emit(payload: dict) -> str:
         return f"data: {json.dumps(payload)}\n\n"
 
-    total_steps = len(PLUGINS) + 2   # plugins + extract + classify
+    total_steps = len(PLUGINS) + 3
+    t_scan = time.monotonic()
 
-    # ── Run each plugin ───────────────────────────────────────────────────────
-    results = {}
-    for i, plugin in enumerate(PLUGINS):
-        short = plugin.split(".")[-1]
+    try:
+        # -- Checksum + upsert dump ------------------------------------------
+        sha256  = await asyncio.to_thread(compute_checksum, dump_path)
+
+        def _upsert():
+            con = get_connection()
+            try:
+                dump_id = upsert_dump(con, sha256, Path(dump_path).stat().st_size, str(dump_path), dump_name)
+                return dump_id
+            finally:
+                con.close()
+        dump_id = await asyncio.to_thread(_upsert)
+
+        # -- Cache check ------------------------------------------------------
+        cached        = False
+        features      = None
+        extraction_id = None
+
+        if not no_cache:
+            def _check_cache():
+                con = get_connection()
+                try:
+                    eid = get_cached_extraction(con, dump_id)
+                    if eid is not None:
+                        feats = load_features(con, eid)
+                        return eid, feats
+                    return None, None
+                finally:
+                    con.close()
+
+            extraction_id, features = await asyncio.to_thread(_check_cache)
+            if features:
+                cached = True
+                for i, plugin in enumerate(PLUGINS):
+                    short = plugin.split(".")[-1]
+                    yield emit({
+                        "type": "progress", "step": i + 1, "total": total_steps,
+                        "label": f"Running {short}", "cached": True,
+                    })
+                    await asyncio.sleep(0)
+                yield emit({
+                    "type": "progress", "step": len(PLUGINS) + 1, "total": total_steps,
+                    "label": "Extracting features", "cached": True,
+                })
+                await asyncio.sleep(0)
+
+        # -- Fresh Volatility run --------------------------------------------
+        if not cached:
+            t0 = time.monotonic()
+            loop = asyncio.get_running_loop()
+            plugin_results = {}
+            step = 0
+
+            # Submit all plugins to the thread pool simultaneously — same
+            # parallelism as run_all_plugins (bounded by plugin_workers=2).
+            # asyncio.as_completed lets us await each finish individually so
+            # we can yield a real progress event after each plugin completes
+            # rather than firing all events before any work starts.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                plugin_futures = [
+                    loop.run_in_executor(
+                        executor, run_plugin,
+                        dump_path, p, str(SYMBOLS_DIR), False, 900,
+                    )
+                    for p in PLUGINS
+                ]
+
+                for coro in asyncio.as_completed(plugin_futures):
+                    plugin, rows = await coro
+                    plugin_results[plugin] = rows
+                    step += 1
+                    short = plugin.split(".")[-1]
+                    yield emit({
+                        "type": "progress", "step": step, "total": total_steps,
+                        "label": f"Running {short}", "cached": False,
+                    })
+
+            elapsed = time.monotonic() - t0
+
+            yield emit({
+                "type": "progress", "step": len(PLUGINS) + 1, "total": total_steps,
+                "label": "Extracting features", "cached": False,
+            })
+
+            features = await asyncio.to_thread(extract_features, plugin_results)
+
+            def _persist_extraction():
+                con = get_connection()
+                try:
+                    eid = insert_extraction(con, dump_id, elapsed=elapsed, vol_version=None, success=True)
+                    insert_plugin_results(con, eid, plugin_results)
+                    insert_features(con, eid, features)
+                    return eid
+                finally:
+                    con.close()
+            extraction_id = await asyncio.to_thread(_persist_extraction)
+
+        # -- Load models ------------------------------------------------------
+        binary_model, binary_features, _, _ = await asyncio.to_thread(
+            load_model, str(stage1_path), "Binary"
+        )
+        family_model, family_features, label_names, _ = await asyncio.to_thread(
+            load_model, str(stage2_path), "Family"
+        )
+
+        # -- Build feature matrix ---------------------------------------------
+        X_raw = pd.DataFrame([features])
+
+        # -- Stage 1 — binary triage ------------------------------------------
         yield emit({
-            "type": "progress",
-            "step": i + 1,
-            "total": total_steps,
-            "label": f"Running {short}",
+            "type": "progress", "step": len(PLUGINS) + 2, "total": total_steps,
+            "label": "Stage 1 — binary triage", "cached": False,
         })
-        await asyncio.sleep(0)
-        results[plugin] = await asyncio.to_thread(run_plugin, dump_path, plugin)
 
-    # ── Feature extraction ────────────────────────────────────────────────────
-    yield emit({
-        "type": "progress",
-        "step": len(PLUGINS) + 1,
-        "total": total_steps,
-        "label": "Extracting features",
-    })
-    await asyncio.sleep(0)
+        is_infected, stage1_confidence = await asyncio.to_thread(
+            stage1_binary, binary_model, binary_features, X_raw, 0.5
+        )
 
-    hidden_mods = results.get("linux.hidden_modules", [])
-    hmod = len(hidden_mods) if hidden_mods else 0
+        # -- Stage 2 — family identification -----------------------------------
+        if is_infected:
+            yield emit({
+                "type": "progress", "step": len(PLUGINS) + 3, "total": total_steps,
+                "label": "Stage 2 — family identification", "cached": False,
+            })
+            threats = await asyncio.to_thread(
+                stage2_families,
+                family_model, family_features, label_names, X_raw, 0.5,
+            )
+        else:
+            yield emit({
+                "type": "progress", "step": len(PLUGINS) + 3, "total": total_steps,
+                "label": "Stage 2 — skipped (clean)", "cached": False,
+            })
+            fallback_labels = label_names or [l.replace("label_", "") for l in LABELS]
+            threats = [
+                {"family": lbl, "detected": False, "confidence": 0.0}
+                for lbl in fallback_labels
+            ]
 
-    has_inj = 0
-    for row in results.get("linux.lsof.Lsof", []):
-        if isinstance(row, dict) and any(
-            isinstance(v, str) and "injection_marker" in v for v in row.values()
-        ):
-            has_inj = 1
-            break
+        any_detected = any(t["detected"] for t in threats)
 
-    sockstat = results.get("linux.sockstat", [])
-    high_port = sum(
-        1 for s in sockstat
-        if isinstance(s, dict) and str(
-            s.get("Source Port") or s.get("Local Port") or s.get("Port") or 0
-        ) == "4444"
-    )
-    total_sock = len(sockstat) if sockstat else SENTINEL
+        # -- Persist scan -----------------------------------------------------
+        def _persist_scan():
+            con = get_connection()
+            try:
+                sid = insert_scan(
+                    con,
+                    dump_id=dump_id,
+                    extraction_id=extraction_id,
+                    pipeline="binary+family" if is_infected else "binary",
+                    binary_model=str(stage1_path),
+                    family_model=str(stage2_path),
+                    cache_hit=cached,
+                )
+                finish_scan(
+                    con, sid,
+                    elapsed_sec=time.monotonic() - t_scan,
+                    stage1_infected=is_infected,
+                    stage1_conf=stage1_confidence,
+                )
+                if threats:
+                    insert_verdicts(con, sid, threats)
+                return sid
+            finally:
+                con.close()
 
-    X = pd.DataFrame([{
-        "hidden_module_count": hmod,
-        "has_injection": has_inj,
-        "high_port_listeners": high_port,
-        "total_sockets": total_sock,
-    }])
+        scan_id = await asyncio.to_thread(_persist_scan)
 
-    # ── Classify ──────────────────────────────────────────────────────────────
-    yield emit({
-        "type": "progress",
-        "step": total_steps,
-        "total": total_steps,
-        "label": "Running classifier",
-    })
-    await asyncio.sleep(0)
+        yield emit({
+            "type": "result",
+            "scan_id": scan_id,
+            "filename": dump_name,
+            "sha256": sha256,
+            "cached": cached,
+            "stage1": {
+                "infected": is_infected,
+                "confidence": round(stage1_confidence * 100, 1) if stage1_confidence is not None else None,
+            },
+            "threats": threats,
+            "features": features,
+            "any_detected": any_detected,
+        })
 
-    model = await asyncio.to_thread(joblib.load, str(model_path))
-    pred = model.predict(X)[0]
-    labels = ["Rootkit", "Code Injection", "Backdoor"]
-    threats = [{"label": l, "detected": bool(d)} for l, d in zip(labels, pred)]
-
-    yield emit({
-        "type": "result",
-        "filename": Path(dump_path).name,
-        "threats": threats,
-        "features": X.iloc[0].to_dict(),
-        "any_detected": any(t["detected"] for t in threats),
-    })
+    except Exception as exc:
+        yield emit({"type": "error", "detail": str(exc)})
 
 
-# ── API ───────────────────────────────────────────────────────────────────────
+# -- Endpoints ----------------------------------------------------------------
 
 @app.post("/analyze")
 async def analyze(
-    dump: UploadFile = File(...),
-    model_path: str = Form(""),
-    model_file: UploadFile = File(None),
+    dump:              UploadFile = File(...),
+    binary_model_file: UploadFile = File(None),
+    family_model_file: UploadFile = File(None),
+    no_cache:          bool       = Query(False, alias="no-cache"),
 ):
-    # ── Resolve model path, writing upload to a temp file if provided ─────────
-    tmp_model_path = None
-    if model_file and model_file.filename:
-        model_bytes = await model_file.read()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tm:
-            tm.write(model_bytes)
-            tmp_model_path = tm.name
-        resolved_model = Path(tmp_model_path)
+    tmp_stage1 = tmp_stage2 = None
+
+    if binary_model_file and binary_model_file.filename:
+        data = await binary_model_file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".joblib") as f:
+            f.write(data); tmp_stage1 = f.name
+        stage1_path = Path(tmp_stage1)
     else:
-        resolved_model = Path(model_path.strip() or DEFAULT_MODEL)
+        stage1_path = DEFAULT_STAGE1
 
-    if not resolved_model.exists():
-        if tmp_model_path:
-            Path(tmp_model_path).unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"Model not found: {resolved_model}")
+    if not stage1_path.exists():
+        raise HTTPException(400, f"Stage 1 model not found: {stage1_path}")
 
-    # ── Write dump to a temp file ─────────────────────────────────────────────
-    content = await dump.read()
-    suffix = Path(dump.filename).suffix or ".raw"
+    if family_model_file and family_model_file.filename:
+        data = await family_model_file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".joblib") as f:
+            f.write(data); tmp_stage2 = f.name
+        stage2_path = Path(tmp_stage2)
+    else:
+        stage2_path = DEFAULT_STAGE2
+
+    if not stage2_path.exists():
+        raise HTTPException(400, f"Stage 2 model not found: {stage2_path}")
+
+    content   = await dump.read()
+    dump_name = dump.filename or "upload.raw"
+    suffix    = Path(dump_name).suffix or ".raw"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(content)
         tmp_dump_path = tmp.name
 
-    # ── Stream - cleanup happens AFTER streaming finishes ────────────────────
     async def stream_and_cleanup():
         try:
-            async for chunk in analyze_stream(tmp_dump_path, resolved_model):
+            async for chunk in analyze_stream(
+                tmp_dump_path, dump_name, stage1_path, stage2_path, no_cache
+            ):
                 yield chunk
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
         finally:
             Path(tmp_dump_path).unlink(missing_ok=True)
-            if tmp_model_path:
-                Path(tmp_model_path).unlink(missing_ok=True)
+            if tmp_stage1: Path(tmp_stage1).unlink(missing_ok=True)
+            if tmp_stage2: Path(tmp_stage2).unlink(missing_ok=True)
 
     return StreamingResponse(
         stream_and_cleanup(),
@@ -206,12 +448,27 @@ async def analyze(
     )
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+@app.get("/scans")
+async def list_scans(limit: int = Query(50)):
+    rows = await asyncio.to_thread(_get_scans, limit)
+    return JSONResponse(rows)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+@app.get("/scans/{scan_id}/export")
+async def export_scan(scan_id: int):
+    data = await asyncio.to_thread(_get_scan_export, scan_id)
+    if data is None:
+        raise HTTPException(404, "Scan not found")
+    return JSONResponse(data)
+
+
+@app.patch("/scans/{scan_id}/label")
+async def label_scan(scan_id: int, label: str = Form(...)):
+    ok = await asyncio.to_thread(_update_scan_label, scan_id, label)
+    if not ok:
+        raise HTTPException(404, "Scan not found")
+    return {"ok": True}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8501, reload=False)
